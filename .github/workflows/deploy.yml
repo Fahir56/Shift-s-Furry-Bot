@@ -1,4 +1,4 @@
-name: Deploy Furry Art Discord App
+name: Deploy Furry Art Discord App (DeviantArt)
 
 on:
   workflow_dispatch:
@@ -38,7 +38,7 @@ jobs:
             "version": "1.0.0",
             "private": true,
             "type": "module",
-            "description": "A safe-only user-installed Discord app for searching furry artwork from DMs, group DMs, and servers.",
+            "description": "A user-installed Discord app for searching non-mature furry artwork on DeviantArt from DMs, group DMs, and servers.",
             "scripts": {
               "check": "node --check src/index.js && node --check scripts/register-commands.js",
               "dev": "wrangler dev",
@@ -87,9 +87,14 @@ jobs:
           });
           
           const EPHEMERAL = 1 << 6;
-          const E926_BASE = "https://e926.net";
+          const DEVIANTART_TOKEN_URL = "https://www.deviantart.com/oauth2/token";
+          const DEVIANTART_SEARCH_URL =
+            "https://www.deviantart.com/api/v1/oauth2/browse/popular";
           const USER_AGENT =
-            "ShiftFurrySearch/1.1 (by Fahir56 on GitHub; safe artwork search)";
+            "ShiftFurrySearch/2.0 (by Fahir56 on GitHub; non-mature art search)";
+
+          let cachedDeviantArtToken = null;
+          let cachedDeviantArtTokenExpiresAt = 0;
           
           const STOP_WORDS = new Set([
             "a",
@@ -199,113 +204,178 @@ jobs:
             }
           
             const unique = [...new Set(tokens)];
-            if (unique.length >= 2 && FUR_COLORS.has(unique[0])) {
-              unique[0] = `${unique[0]}_fur`;
+
+            // DeviantArt accepts a normal text query. Keep enough words to preserve
+            // the user's description while preventing very long search strings.
+            return { tags: unique.slice(0, 5), blocked };
+          }
+          
+          function normalizeSearchTerms(tags) {
+            return tags
+              .map((tag) => tag.replaceAll("_", " "))
+              .filter(Boolean)
+              .join(" ");
+          }
+
+          function imageUrlFor(deviation) {
+            const candidates = [
+              deviation?.content?.src,
+              deviation?.thumbs?.find((thumb) => Number(thumb?.height ?? 0) >= 400)?.src,
+              deviation?.thumbs?.at?.(-1)?.src,
+            ];
+            return candidates.find(
+              (value) => typeof value === "string" && value.startsWith("https://"),
+            );
+          }
+
+          function isDisplayableArtwork(deviation) {
+            return (
+              deviation?.is_mature === false &&
+              deviation?.is_deleted !== true &&
+              Boolean(imageUrlFor(deviation)) &&
+              typeof deviation?.url === "string" &&
+              deviation.url.startsWith("https://")
+            );
+          }
+
+          async function getDeviantArtToken(env) {
+            const now = Date.now();
+            if (cachedDeviantArtToken && now < cachedDeviantArtTokenExpiresAt) {
+              return cachedDeviantArtToken;
             }
-          
-            // Anonymous searches on booru-style APIs are most reliable with a small
-            // number of normal tags. Keep the two strongest words from the sentence.
-            return { tags: unique.slice(0, 2), blocked };
-          }
-          
-          function imageUrlFor(post) {
-            const candidates = [post?.sample?.url, post?.file?.url, post?.preview?.url];
-            return candidates.find((value) => typeof value === "string" && value.startsWith("https://"));
-          }
-          
-          function isDisplayableImage(post) {
-            const extension = String(post?.file?.ext ?? "").toLowerCase();
-            return ["jpg", "jpeg", "png", "gif", "webp"].includes(extension) && Boolean(imageUrlFor(post));
-          }
-          
-          async function findArtwork(tags) {
-            // Do not use order:random here. It is currently unreliable on e926/e621
-            // and can make the API reject an otherwise valid search. We request a
-            // larger normal result page and randomize the result inside the Worker.
-            const searchTags = tags.join(" ");
-            const url = new URL(`${E926_BASE}/posts.json`);
-            url.searchParams.set("limit", "100");
-            url.searchParams.set("tags", searchTags);
-          
-            const response = await fetch(url, {
+
+            if (!env.DEVIANTART_CLIENT_ID || !env.DEVIANTART_CLIENT_SECRET) {
+              throw new Error(
+                "DEVIANTART_CLIENT_ID or DEVIANTART_CLIENT_SECRET is not configured",
+              );
+            }
+
+            const form = new URLSearchParams({
+              grant_type: "client_credentials",
+              client_id: env.DEVIANTART_CLIENT_ID,
+              client_secret: env.DEVIANTART_CLIENT_SECRET,
+            });
+
+            const response = await fetch(DEVIANTART_TOKEN_URL, {
+              method: "POST",
               headers: {
                 accept: "application/json",
-                "accept-language": "en-US,en;q=0.8",
+                "content-type": "application/x-www-form-urlencoded",
                 "user-agent": USER_AGENT,
               },
-              redirect: "follow",
+              body: form.toString(),
             });
-          
+
             const body = await response.text();
             if (!response.ok) {
               console.error(
-                "e926 request failed",
+                "DeviantArt token request failed",
+                response.status,
+                response.headers.get("content-type"),
+                body.slice(0, 300),
+              );
+              throw new Error(`DeviantArt token request returned HTTP ${response.status}`);
+            }
+
+            let payload;
+            try {
+              payload = JSON.parse(body);
+            } catch {
+              console.error("DeviantArt token response was not JSON", body.slice(0, 300));
+              throw new Error("DeviantArt token response was invalid");
+            }
+
+            if (typeof payload?.access_token !== "string") {
+              console.error("DeviantArt token response had no access_token", payload);
+              throw new Error("DeviantArt token response had no access token");
+            }
+
+            const expiresInSeconds = Math.max(60, Number(payload?.expires_in ?? 3600));
+            cachedDeviantArtToken = payload.access_token;
+            cachedDeviantArtTokenExpiresAt =
+              now + Math.max(60, expiresInSeconds - 120) * 1000;
+            return cachedDeviantArtToken;
+          }
+
+          async function findArtwork(tags, env) {
+            const token = await getDeviantArtToken(env);
+            const terms = normalizeSearchTerms(tags);
+            const query = `furry ${terms}`.trim();
+            const url = new URL(DEVIANTART_SEARCH_URL);
+            url.searchParams.set("q", query);
+            url.searchParams.set("timerange", "alltime");
+            url.searchParams.set("limit", "50");
+            url.searchParams.set("offset", String(Math.floor(Math.random() * 5) * 10));
+            url.searchParams.set("mature_content", "false");
+            url.searchParams.set("with_session", "false");
+
+            const response = await fetch(url, {
+              headers: {
+                accept: "application/json",
+                authorization: `Bearer ${token}`,
+                "user-agent": USER_AGENT,
+                "dA-minor-version": "20240701",
+              },
+            });
+
+            const body = await response.text();
+            if (!response.ok) {
+              console.error(
+                "DeviantArt search failed",
                 response.status,
                 response.headers.get("content-type"),
                 body.slice(0, 300),
               );
               throw new Error(`Artwork source returned HTTP ${response.status}`);
             }
-          
+
             let payload;
             try {
               payload = JSON.parse(body);
             } catch {
               console.error(
-                "e926 returned non-JSON",
+                "DeviantArt returned non-JSON",
                 response.headers.get("content-type"),
                 body.slice(0, 300),
               );
               throw new Error("Artwork source returned invalid JSON");
             }
-          
-            const posts = Array.isArray(payload?.posts) ? payload.posts : [];
-            const usable = posts.filter(isDisplayableImage);
+
+            const results = Array.isArray(payload?.results) ? payload.results : [];
+            const usable = results.filter(isDisplayableArtwork);
             if (usable.length === 0) return null;
-          
             return usable[Math.floor(Math.random() * usable.length)];
           }
-          
-          function buildArtworkMessage(post, tags) {
-            const artists = Array.isArray(post?.tags?.artist)
-              ? post.tags.artist.filter((tag) => tag !== "conditional_dnp").slice(0, 4)
-              : [];
-            const artistText = artists.length
-              ? artists.map((artist) => artist.replaceAll("_", " ")).join(", ")
-              : "Unknown / untagged";
-          
-            const postUrl = `${E926_BASE}/posts/${post.id}`;
-            const imageUrl = imageUrlFor(post);
-            const score = Number(post?.score?.total ?? 0);
-            const matchedTags = tags.join(" ");
-            const encodedTags = encodeURIComponent(matchedTags).slice(0, 78);
-          
+
+          function buildArtworkMessage(deviation, tags) {
+            const artistText = cleanText(deviation?.author?.username ?? "Unknown", 100);
+            const postUrl = deviation.url;
+            const imageUrl = imageUrlFor(deviation);
+            const title = cleanText(deviation?.title ?? "Furry artwork", 200);
+            const matchedTerms = normalizeSearchTerms(tags);
+            const encodedTags = encodeURIComponent(tags.join(" ")).slice(0, 78);
+
             return {
               embeds: [
                 {
-                  title: "Safe furry artwork",
+                  title: title || "Non-mature furry artwork",
                   url: postUrl,
-                  description: `Search: \`${cleanText(matchedTags, 80)}\``,
+                  description: `Search: \`${cleanText(matchedTerms, 80)}\``,
                   fields: [
                     {
-                      name: "Artist tag",
-                      value: cleanText(artistText, 200) || "Unknown / untagged",
-                      inline: true,
-                    },
-                    {
-                      name: "Score",
-                      value: String(score),
+                      name: "Artist",
+                      value: artistText || "Unknown",
                       inline: true,
                     },
                     {
                       name: "Credit & source",
-                      value: `[Open the artwork post](${postUrl})`,
+                      value: `[Open on DeviantArt](${postUrl})`,
                       inline: false,
                     },
                   ],
                   image: { url: imageUrl },
                   footer: {
-                    text: `Safe-only result • post ${post.id}`,
+                    text: "Non-mature result from DeviantArt",
                   },
                 },
               ],
@@ -332,14 +402,14 @@ jobs:
               allowed_mentions: { parse: [] },
             };
           }
-          
-          async function searchAndBuild(tags) {
-            const post = await findArtwork(tags);
-            if (!post) return null;
-            return buildArtworkMessage(post, tags);
+
+          async function searchAndBuild(tags, env) {
+            const deviation = await findArtwork(tags, env);
+            if (!deviation) return null;
+            return buildArtworkMessage(deviation, tags);
           }
-          
-          async function handleCommand(interaction) {
+
+          async function handleCommand(interaction, env) {
             if (interaction?.data?.name !== "furry") {
               return ephemeralMessage("Unknown command.");
             }
@@ -361,7 +431,7 @@ jobs:
             }
           
             try {
-              const message = await searchAndBuild(tags);
+              const message = await searchAndBuild(tags, env);
               if (!message) {
                 return ephemeralMessage(
                   `No safe image result was found for \`${cleanText(tags.join(" "), 80)}\`. Try fewer or simpler words.`,
@@ -378,7 +448,7 @@ jobs:
             }
           }
           
-          async function handleComponent(interaction) {
+          async function handleComponent(interaction, env) {
             const customId = String(interaction?.data?.custom_id ?? "");
             if (!customId.startsWith("another:")) {
               return ephemeralMessage("Unknown button.");
@@ -397,7 +467,7 @@ jobs:
             }
           
             try {
-              const message = await searchAndBuild(tags);
+              const message = await searchAndBuild(tags, env);
               if (!message) {
                 return ephemeralMessage("No other safe result was found for that search.");
               }
@@ -455,11 +525,11 @@ jobs:
               }
           
               if (interaction.type === INTERACTION.APPLICATION_COMMAND) {
-                return handleCommand(interaction);
+                return handleCommand(interaction, env);
               }
           
               if (interaction.type === INTERACTION.MESSAGE_COMPONENT) {
-                return handleComponent(interaction);
+                return handleComponent(interaction, env);
               }
           
               return ephemeralMessage("Unsupported Discord interaction.");
@@ -570,11 +640,25 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           DISCORD_PUBLIC_KEY: ${{ secrets.DISCORD_PUBLIC_KEY }}
 
+      - name: Add DeviantArt client ID to Worker
+        shell: bash
+        run: printf '%s' "$DEVIANTART_CLIENT_ID" | npx wrangler secret put DEVIANTART_CLIENT_ID
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          DEVIANTART_CLIENT_ID: ${{ secrets.DEVIANTART_CLIENT_ID }}
+
+      - name: Add DeviantArt client secret to Worker
+        shell: bash
+        run: printf '%s' "$DEVIANTART_CLIENT_SECRET" | npx wrangler secret put DEVIANTART_CLIENT_SECRET
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          DEVIANTART_CLIENT_SECRET: ${{ secrets.DEVIANTART_CLIENT_SECRET }}
+
       - name: Register user-installed slash command
         run: npm run register
         env:
           DISCORD_APPLICATION_ID: ${{ secrets.DISCORD_APPLICATION_ID }}
           DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
-          
-            
           
