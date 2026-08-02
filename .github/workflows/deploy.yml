@@ -906,17 +906,43 @@ jobs:
       - name: Verify e926 and e621 from Vercel
         shell: bash
         run: |
+          set -euo pipefail
           HEALTH_URL="${{ steps.vercel.outputs.deployment_url }}/health?q=blue%20wolf"
           echo "Testing $HEALTH_URL"
-          curl --fail --show-error --silent --retry 3 --retry-delay 2 "$HEALTH_URL" | tee /tmp/health.json
-          node -e '
-            const report = JSON.parse(require("fs").readFileSync("/tmp/health.json", "utf8"));
-            console.log(JSON.stringify(report, null, 2));
-            if (!report.ok) {
-              console.error("At least one artwork source is blocked from Vercel.");
-              process.exit(1);
-            }
-          '
+
+          # Vercel may redirect the raw deployment URL to its canonical production URL.
+          # Follow that redirect before trying to parse the response as JSON.
+          curl \
+            --location \
+            --max-redirs 5 \
+            --fail-with-body \
+            --show-error \
+            --silent \
+            --retry 3 \
+            --retry-all-errors \
+            --retry-delay 2 \
+            --output /tmp/health.json \
+            "$HEALTH_URL"
+
+          cat /tmp/health.json
+          node <<'NODE_EOF'
+          const fs = require("fs");
+          const raw = fs.readFileSync("/tmp/health.json", "utf8").trim();
+          let report;
+          try {
+            report = JSON.parse(raw);
+          } catch (error) {
+            console.error("The Vercel health endpoint did not return JSON.");
+            console.error("Response preview:", raw.slice(0, 500));
+            process.exit(1);
+          }
+
+          console.log(JSON.stringify(report, null, 2));
+          if (!report.ok) {
+            console.error("At least one artwork source is blocked from Vercel.");
+            process.exit(1);
+          }
+          NODE_EOF
 
       - name: Point Discord to Vercel and register commands
         run: node scripts/configure-discord.js
