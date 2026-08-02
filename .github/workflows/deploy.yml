@@ -960,4 +960,5 @@ jobs:
         env:
           DISCORD_APPLICATION_ID: ${{ secrets.DISCORD_APPLICATION_ID }}
           DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
-          INTERACTIONS_ENDPOINT_URL
+          INTERACTIONS_ENDPOINT_URL: ${{ steps.vercel.outputs.public_base_url }}/api/interactions
+          
