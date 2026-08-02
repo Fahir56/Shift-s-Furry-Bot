@@ -262,7 +262,7 @@ jobs:
                 waitUntil(finishSearch(interaction, mode, parsed.tags));
                 return json({
                   type: RESPONSE.DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE,
-                  data: { flags: EPHEMERAL },
+                  data: {},
                 });
               }
           
