@@ -1,4 +1,4 @@
-name: Deploy Furry Art Discord App (DeviantArt RSS)
+name: Deploy Furry Art Discord App (DeviantArt Reader Fallback)
 
 on:
   workflow_dispatch:
@@ -35,10 +35,10 @@ jobs:
           cat > package.json <<'PACKAGE_EOF'
           {
             "name": "furry-art-discord-user-app",
-            "version": "4.0.0",
+            "version": "5.0.0",
             "private": true,
             "type": "module",
-            "description": "A user-installed Discord app that searches filtered furry artwork through DeviantArt public RSS.",
+            "description": "A user-installed Discord app that searches DeviantArt through direct RSS and a reader fallback.",
             "scripts": {
               "check": "node --check src/index.js && node --check scripts/register-commands.js",
               "deploy": "wrangler deploy",
@@ -90,43 +90,43 @@ jobs:
 
           cat > src/index.js <<'WORKER_EOF'
           import { verifyKey } from "discord-interactions";
-          
+
           const INTERACTION = Object.freeze({
             PING: 1,
             APPLICATION_COMMAND: 2,
             MESSAGE_COMPONENT: 3,
           });
-          
+
           const RESPONSE = Object.freeze({
             PONG: 1,
             CHANNEL_MESSAGE_WITH_SOURCE: 4,
-            UPDATE_MESSAGE: 7,
+            DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE: 5,
+            DEFERRED_UPDATE_MESSAGE: 6,
           });
-          
+
           const EPHEMERAL = 1 << 6;
           const RSS_URL = "https://backend.deviantart.com/rss.xml";
+          const DEVIANTART_SEARCH_URL = "https://www.deviantart.com/search/deviations";
+          const JINA_READER_PREFIX = "https://r.jina.ai/";
           const USER_AGENT =
-            "ShiftFurrySearch/4.0 (Discord user app; DeviantArt public RSS reader)";
-          
+            "ShiftFurrySearch/5.0 (Discord user app; DeviantArt reader fallback)";
+
           const STOP_WORDS = new Set([
             "a", "an", "and", "art", "artwork", "drawing", "furry", "for",
             "from", "in", "of", "on", "picture", "please", "show", "the",
             "to", "with",
           ]);
-          
+
           const BLOCKED_WORDS = new Set([
             "adult", "explicit", "fetish", "naked", "nude", "nsfw", "porn",
             "pornographic", "sex", "sexual", "yiff",
           ]);
-          
-          // RSS has no trustworthy structured mature-content flag, so this is a
-          // deliberately conservative best-effort filter over titles, descriptions,
-          // categories and URLs.
+
           const UNSAFE_RESULT_PATTERN = new RegExp(
             String.raw`\b(adult|explicit|fetish|naked|nudity|nude|nsfw|porn|pornographic|sex|sexual|sexy|yiff|18\+|mature content|gore|guro|vore|inflation|pregnant|pregnancy|diaper|feet fetish|bondage|bdsm)\b`,
             "i",
           );
-          
+
           function json(data, status = 200) {
             return new Response(JSON.stringify(data), {
               status,
@@ -136,14 +136,14 @@ jobs:
               },
             });
           }
-          
+
           function ephemeralMessage(content) {
             return json({
               type: RESPONSE.CHANNEL_MESSAGE_WITH_SOURCE,
               data: { content, flags: EPHEMERAL },
             });
           }
-          
+
           function cleanText(value, maxLength) {
             return String(value ?? "")
               .replace(/[\u0000-\u001F\u007F]/g, " ")
@@ -151,38 +151,38 @@ jobs:
               .trim()
               .slice(0, maxLength);
           }
-          
+
           function tokenizeQuery(input) {
             const raw = cleanText(input, 80).toLowerCase();
             if (!raw) return { terms: [], blocked: false };
-          
+
             const pieces = raw.match(/"[^"]+"|'[^']+'|\S+/g) ?? [];
             const terms = [];
             let blocked = false;
-          
+
             for (const piece of pieces) {
-              const withoutQuotes = piece.replace(/^['"]|['"]$/g, "");
+              const withoutQuotes = piece.replace(/^["']|["']$/g, "");
               const normalized = withoutQuotes
                 .normalize("NFKD")
                 .replace(/[^a-z0-9 _-]/g, "")
                 .replace(/[-_\s]+/g, " ")
                 .trim()
                 .slice(0, 35);
-          
+
               if (!normalized) continue;
               const words = normalized.split(/\s+/);
               if (words.some((word) => BLOCKED_WORDS.has(word))) {
                 blocked = true;
                 continue;
               }
-          
+
               if (STOP_WORDS.has(normalized)) continue;
               terms.push(normalized);
             }
-          
+
             return { terms: [...new Set(terms)].slice(0, 6), blocked };
           }
-          
+
           function decodeXmlEntities(value) {
             return String(value ?? "")
               .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, "$1")
@@ -200,7 +200,7 @@ jobs:
               .replace(/&gt;/g, ">")
               .replace(/&amp;/g, "&");
           }
-          
+
           function stripHtml(value) {
             return cleanText(
               decodeXmlEntities(value)
@@ -210,29 +210,27 @@ jobs:
               1000,
             );
           }
-          
+
           function extractTag(block, tagName) {
             const escaped = tagName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
             const match = block.match(new RegExp(`<${escaped}(?:\\s[^>]*)?>([\\s\\S]*?)<\\/${escaped}>`, "i"));
             return match ? decodeXmlEntities(match[1]).trim() : "";
           }
-          
+
           function extractAllTags(block, tagName) {
             const escaped = tagName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
             const regex = new RegExp(`<${escaped}(?:\\s[^>]*)?>([\\s\\S]*?)<\\/${escaped}>`, "gi");
             const values = [];
-            for (const match of block.matchAll(regex)) {
-              values.push(stripHtml(match[1]));
-            }
+            for (const match of block.matchAll(regex)) values.push(stripHtml(match[1]));
             return values.filter(Boolean);
           }
-          
+
           function extractAttribute(tag, attributeName) {
             const escaped = attributeName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
             const match = tag.match(new RegExp(`\\b${escaped}\\s*=\\s*(["'])([\\s\\S]*?)\\1`, "i"));
             return match ? decodeXmlEntities(match[2]).trim() : "";
           }
-          
+
           function collectAttributeUrls(block, tagName, attributeName) {
             const escapedTag = tagName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
             const regex = new RegExp(`<${escapedTag}\\b[^>]*>`, "gi");
@@ -243,7 +241,7 @@ jobs:
             }
             return urls;
           }
-          
+
           function isHttpsUrl(value) {
             if (typeof value !== "string" || !value.startsWith("https://")) return false;
             try {
@@ -252,7 +250,7 @@ jobs:
               return false;
             }
           }
-          
+
           function isDeviantArtPage(value) {
             if (!isHttpsUrl(value)) return false;
             try {
@@ -262,70 +260,135 @@ jobs:
               return false;
             }
           }
-          
+
+          function isLikelyArtworkImage(value) {
+            if (!isHttpsUrl(value)) return false;
+            try {
+              const url = new URL(value);
+              const host = url.hostname.toLowerCase();
+              const path = url.pathname.toLowerCase();
+              if (host.includes("deviantart.net") || host.includes("wixmp.com")) return true;
+              return /\.(?:jpe?g|png|gif|webp)(?:$|\?)/i.test(`${path}${url.search}`);
+            } catch {
+              return false;
+            }
+          }
+
           function creatorFromSourceUrl(sourceUrl) {
             try {
-              const url = new URL(sourceUrl);
-              const first = url.pathname.split("/").filter(Boolean)[0];
-              if (first && !["art", "deviation", "gallery", "tag"].includes(first.toLowerCase())) {
-                return first;
-              }
+              const first = new URL(sourceUrl).pathname.split("/").filter(Boolean)[0];
+              if (first && !["art", "deviation", "gallery", "tag", "search"].includes(first.toLowerCase())) return first;
             } catch {}
             return "Unknown artist";
           }
-          
-          function parseRssItems(xml) {
+
+          function parseRssItems(xmlLike) {
+            const variants = [
+              String(xmlLike ?? ""),
+              decodeXmlEntities(xmlLike),
+              decodeXmlEntities(String(xmlLike ?? "").replace(/<br\s*\/?>/gi, "\n")),
+            ];
             const items = [];
-            const itemRegex = /<item\b[^>]*>([\s\S]*?)<\/item>/gi;
-          
-            for (const match of xml.matchAll(itemRegex)) {
-              const block = match[1];
-              const title = stripHtml(extractTag(block, "title")) || "DeviantArt artwork";
-              const sourceUrl = extractTag(block, "link") || extractTag(block, "guid");
-              const descriptionRaw = extractTag(block, "description");
-              const description = stripHtml(descriptionRaw);
-              const categories = [
-                ...extractAllTags(block, "category"),
-                ...extractAllTags(block, "media:category"),
-              ];
-          
-              const decodedDescription = decodeXmlEntities(descriptionRaw);
-              const imageCandidates = [
-                ...collectAttributeUrls(block, "media:content", "url"),
-                ...collectAttributeUrls(block, "media:thumbnail", "url"),
-                ...collectAttributeUrls(block, "enclosure", "url"),
-                ...collectAttributeUrls(decodedDescription, "img", "src"),
-              ].filter(isHttpsUrl);
-          
-              const creator = cleanText(
-                extractTag(block, "media:credit") ||
-                extractTag(block, "dc:creator") ||
-                creatorFromSourceUrl(sourceUrl),
-                100,
-              ) || "Unknown artist";
-          
-              const published = cleanText(extractTag(block, "pubDate"), 100);
-              const imageUrl = imageCandidates[0] ?? null;
-              const safetyText = `${title} ${description} ${categories.join(" ")} ${sourceUrl} ${imageUrl}`;
-          
-              if (!isDeviantArtPage(sourceUrl)) continue;
-              if (!imageUrl) continue;
-              if (UNSAFE_RESULT_PATTERN.test(safetyText)) continue;
-          
-              items.push({
-                title: cleanText(title, 200),
-                sourceUrl,
-                imageUrl,
-                creator,
-                description: cleanText(description, 350),
-                categories: categories.slice(0, 20),
-                published,
-              });
+            const seen = new Set();
+
+            for (const xml of variants) {
+              const itemRegex = /<item\b[^>]*>([\s\S]*?)<\/item>/gi;
+              for (const match of xml.matchAll(itemRegex)) {
+                const block = match[1];
+                const title = stripHtml(extractTag(block, "title")) || "DeviantArt artwork";
+                const sourceUrl = extractTag(block, "link") || extractTag(block, "guid");
+                const descriptionRaw = extractTag(block, "description");
+                const description = stripHtml(descriptionRaw);
+                const categories = [
+                  ...extractAllTags(block, "category"),
+                  ...extractAllTags(block, "media:category"),
+                ];
+
+                const decodedDescription = decodeXmlEntities(descriptionRaw);
+                const imageCandidates = [
+                  ...collectAttributeUrls(block, "media:content", "url"),
+                  ...collectAttributeUrls(block, "media:thumbnail", "url"),
+                  ...collectAttributeUrls(block, "enclosure", "url"),
+                  ...collectAttributeUrls(decodedDescription, "img", "src"),
+                ].filter(isLikelyArtworkImage);
+
+                const creator = cleanText(
+                  extractTag(block, "media:credit") ||
+                  extractTag(block, "dc:creator") ||
+                  creatorFromSourceUrl(sourceUrl),
+                  100,
+                ) || "Unknown artist";
+
+                const published = cleanText(extractTag(block, "pubDate"), 100);
+                const imageUrl = imageCandidates[0] ?? null;
+                const safetyText = `${title} ${description} ${categories.join(" ")} ${sourceUrl} ${imageUrl}`;
+
+                if (!isDeviantArtPage(sourceUrl) || !imageUrl || UNSAFE_RESULT_PATTERN.test(safetyText)) continue;
+                const identity = `${sourceUrl}\n${imageUrl}`;
+                if (seen.has(identity)) continue;
+                seen.add(identity);
+                items.push({
+                  title: cleanText(title, 200),
+                  sourceUrl,
+                  imageUrl,
+                  creator,
+                  description: cleanText(description, 350),
+                  categories: categories.slice(0, 20),
+                  published,
+                });
+              }
+              if (items.length > 0) break;
             }
-          
+
             return items;
           }
-          
+
+          function parseReaderMarkdown(markdown) {
+            const text = String(markdown ?? "");
+            const images = [];
+            const links = [];
+
+            for (const match of text.matchAll(/!\[([^\]]*)\]\((https:\/\/[^)\s]+)\)/g)) {
+              if (isLikelyArtworkImage(match[2])) images.push({ index: match.index ?? 0, alt: cleanText(match[1], 200), url: match[2] });
+            }
+
+            for (const match of text.matchAll(/\[([^\]]*)\]\((https:\/\/[^)\s]+)\)/g)) {
+              const url = match[2];
+              if (!isDeviantArtPage(url)) continue;
+              let path = "";
+              try { path = new URL(url).pathname.toLowerCase(); } catch {}
+              if (!path.includes("/art/") && !path.includes("/deviation/")) continue;
+              links.push({ index: match.index ?? 0, title: cleanText(match[1], 200), url });
+            }
+
+            const items = [];
+            const seen = new Set();
+            for (const image of images) {
+              const nearby = links
+                .map((link) => ({ link, distance: Math.abs(link.index - image.index) }))
+                .filter((entry) => entry.distance <= 2500)
+                .sort((a, b) => a.distance - b.distance)[0]?.link;
+              if (!nearby) continue;
+
+              const title = nearby.title || image.alt || "DeviantArt artwork";
+              const safetyText = `${title} ${image.alt} ${nearby.url} ${image.url}`;
+              if (UNSAFE_RESULT_PATTERN.test(safetyText)) continue;
+              const identity = `${nearby.url}\n${image.url}`;
+              if (seen.has(identity)) continue;
+              seen.add(identity);
+              items.push({
+                title: cleanText(title, 200),
+                sourceUrl: nearby.url,
+                imageUrl: image.url,
+                creator: cleanText(creatorFromSourceUrl(nearby.url), 100),
+                description: cleanText(image.alt, 350),
+                categories: [],
+                published: "",
+              });
+            }
+            return items;
+          }
+
           function buildFeedUrl(searchExpression, offset = 0) {
             const url = new URL(RSS_URL);
             url.searchParams.set("type", "deviation");
@@ -334,77 +397,155 @@ jobs:
             url.searchParams.set("mature_content", "false");
             return url;
           }
-          
+
           function rssSearches(terms) {
             const text = terms.join(" ");
             return [
-              {
-                label: "newest",
-                url: buildFeedUrl(`sort:time furry ${text} meta:all`.trim(), 0),
-              },
-              {
-                label: "popular-week",
-                url: buildFeedUrl(`boost:popular max_age:168h furry ${text} meta:all`.trim(), 0),
-              },
+              { label: "newest", url: buildFeedUrl(`sort:time furry ${text} meta:all`.trim(), 0) },
+              { label: "popular-week", url: buildFeedUrl(`boost:popular max_age:168h furry ${text} meta:all`.trim(), 0) },
             ];
           }
-          
-          async function requestRssFeed(search) {
+
+          function buildSearchPageUrl(terms) {
+            const url = new URL(DEVIANTART_SEARCH_URL);
+            url.searchParams.set("q", `furry ${terms.join(" ")}`.trim());
+            return url;
+          }
+
+          function jinaUrl(targetUrl) {
+            return new URL(`${JINA_READER_PREFIX}${targetUrl.toString()}`);
+          }
+
+          async function fetchWithTimeout(url, options, timeoutMilliseconds) {
+            return fetch(url, { ...options, signal: AbortSignal.timeout(timeoutMilliseconds) });
+          }
+
+          async function requestDirectRss(search) {
             let response;
             try {
-              response = await fetch(search.url, {
+              response = await fetchWithTimeout(search.url, {
                 headers: {
                   accept: "application/rss+xml, application/xml;q=0.9, text/xml;q=0.8, */*;q=0.1",
                   "user-agent": USER_AGENT,
                 },
                 redirect: "follow",
-                signal: AbortSignal.timeout(2300),
-              });
+              }, 2500);
             } catch (error) {
-              const wrapped = new Error(`DeviantArt RSS ${search.label} request failed: ${error?.message ?? error}`);
+              const wrapped = new Error(`Direct DeviantArt RSS ${search.label} failed: ${error?.message ?? error}`);
               wrapped.status = 0;
               wrapped.label = search.label;
               throw wrapped;
             }
-          
+
             const body = await response.text();
             if (!response.ok) {
-              console.error(
-                "DeviantArt RSS request failed",
-                search.label,
-                response.status,
-                response.headers.get("content-type"),
-                body.slice(0, 300),
-              );
-              const error = new Error(`DeviantArt RSS returned HTTP ${response.status}`);
+              const error = new Error(`Direct DeviantArt RSS returned HTTP ${response.status}`);
               error.status = response.status;
               error.label = search.label;
               error.bodyPreview = body.slice(0, 180);
               throw error;
             }
-          
-            if (!/<(?:rss|rdf:RDF)\b/i.test(body)) {
-              console.error("DeviantArt RSS returned non-feed content", search.label, body.slice(0, 300));
-              const error = new Error("DeviantArt RSS returned an invalid feed");
+
+            const items = parseRssItems(body);
+            if (items.length === 0) {
+              const error = new Error("Direct DeviantArt RSS returned no parseable items");
               error.status = response.status;
               error.label = search.label;
               error.bodyPreview = body.slice(0, 180);
               throw error;
             }
-          
-            return {
-              label: search.label,
-              status: response.status,
-              contentType: response.headers.get("content-type"),
-              body,
-              items: parseRssItems(body),
-            };
+
+            return { route: "direct-rss", label: search.label, status: response.status, contentType: response.headers.get("content-type"), items };
           }
-          
+
+          async function requestRssThroughReader(search) {
+            const readerUrl = jinaUrl(search.url);
+            let response;
+            try {
+              response = await fetchWithTimeout(readerUrl, {
+                headers: {
+                  accept: "text/plain",
+                  "user-agent": USER_AGENT,
+                  "x-respond-with": "html",
+                  "x-retain-images": "all",
+                  "x-retain-links": "all",
+                  "x-timeout": "15",
+                },
+                redirect: "follow",
+              }, 22000);
+            } catch (error) {
+              const wrapped = new Error(`Reader proxy ${search.label} failed: ${error?.message ?? error}`);
+              wrapped.status = 0;
+              wrapped.label = search.label;
+              throw wrapped;
+            }
+
+            const body = await response.text();
+            if (!response.ok) {
+              const error = new Error(`Reader proxy returned HTTP ${response.status}`);
+              error.status = response.status;
+              error.label = search.label;
+              error.bodyPreview = body.slice(0, 180);
+              throw error;
+            }
+
+            const items = parseRssItems(body);
+            if (items.length === 0) {
+              const error = new Error("Reader proxy returned no parseable RSS items");
+              error.status = response.status;
+              error.label = search.label;
+              error.bodyPreview = body.slice(0, 180);
+              throw error;
+            }
+
+            return { route: "reader-rss", label: search.label, status: response.status, contentType: response.headers.get("content-type"), items };
+          }
+
+          async function requestSearchPageThroughReader(terms) {
+            const targetUrl = buildSearchPageUrl(terms);
+            const readerUrl = jinaUrl(targetUrl);
+            let response;
+            try {
+              response = await fetchWithTimeout(readerUrl, {
+                headers: {
+                  accept: "text/plain",
+                  "user-agent": USER_AGENT,
+                  "x-respond-with": "markdown",
+                  "x-retain-images": "all",
+                  "x-retain-links": "all",
+                  "x-timeout": "18",
+                },
+                redirect: "follow",
+              }, 25000);
+            } catch (error) {
+              const wrapped = new Error(`Reader search-page fallback failed: ${error?.message ?? error}`);
+              wrapped.status = 0;
+              throw wrapped;
+            }
+
+            const body = await response.text();
+            if (!response.ok) {
+              const error = new Error(`Reader search-page fallback returned HTTP ${response.status}`);
+              error.status = response.status;
+              error.bodyPreview = body.slice(0, 180);
+              throw error;
+            }
+
+            const items = parseReaderMarkdown(body);
+            if (items.length === 0) {
+              const error = new Error("Reader search-page fallback returned no parseable artwork");
+              error.status = response.status;
+              error.bodyPreview = body.slice(0, 180);
+              throw error;
+            }
+
+            return { route: "reader-search-page", label: "search-page", status: response.status, contentType: response.headers.get("content-type"), items, targetUrl };
+          }
+
           function itemIdentity(item) {
             return `${item.sourceUrl}\n${item.imageUrl}`;
           }
-          
+
           function rankArtwork(item, terms) {
             const haystack = `${item.title} ${item.description} ${item.categories.join(" ")}`.toLowerCase();
             let score = Math.random() * 2;
@@ -415,187 +556,146 @@ jobs:
             }
             return score;
           }
-          
-          async function findArtwork(terms) {
-            const searches = rssSearches(terms);
-            const settled = await Promise.allSettled(searches.map(requestRssFeed));
+
+          async function collectFrom(searches, requester, errors) {
+            const settled = await Promise.allSettled(searches.map(requester));
             const collected = new Map();
-            const errors = [];
-          
+            const routes = [];
             for (const result of settled) {
               if (result.status === "fulfilled") {
-                for (const item of result.value.items) {
-                  collected.set(itemIdentity(item), item);
-                }
+                routes.push(result.value.route);
+                for (const item of result.value.items) collected.set(itemIdentity(item), item);
               } else {
                 errors.push(result.reason);
               }
             }
-          
-            const usable = [...collected.values()];
-            if (usable.length > 0) {
-              usable.sort((a, b) => rankArtwork(b, terms) - rankArtwork(a, terms));
-              const candidatePool = usable.slice(0, Math.min(12, usable.length));
-              return candidatePool[Math.floor(Math.random() * candidatePool.length)];
-            }
-          
-            if (errors.length === settled.length) {
-              throw errors[0] ?? new Error("All DeviantArt RSS requests failed");
-            }
-          
-            return null;
+            return { items: [...collected.values()], routes };
           }
-          
-          function buildArtworkMessage(item, terms) {
+
+          async function findArtwork(terms) {
+            const searches = rssSearches(terms);
+            const errors = [];
+
+            const direct = await collectFrom(searches, requestDirectRss, errors);
+            let usable = direct.items;
+            let route = direct.routes[0] ?? null;
+
+            if (usable.length === 0) {
+              const proxied = await collectFrom(searches, requestRssThroughReader, errors);
+              usable = proxied.items;
+              route = proxied.routes[0] ?? route;
+            }
+
+            if (usable.length === 0) {
+              try {
+                const page = await requestSearchPageThroughReader(terms);
+                usable = page.items;
+                route = page.route;
+              } catch (error) {
+                errors.push(error);
+              }
+            }
+
+            if (usable.length === 0) {
+              const error = errors.at(-1) ?? new Error("All DeviantArt retrieval routes failed");
+              error.allErrors = errors.map((entry) => cleanText(entry?.message ?? entry, 180));
+              throw error;
+            }
+
+            usable.sort((a, b) => rankArtwork(b, terms) - rankArtwork(a, terms));
+            const pool = usable.slice(0, Math.min(12, usable.length));
+            return { item: pool[Math.floor(Math.random() * pool.length)], route };
+          }
+
+          function buildArtworkMessage(item, terms, route) {
             const searchText = terms.join(" ");
             const encodedTerms = encodeURIComponent(searchText).slice(0, 78);
             const fields = [
-              {
-                name: "Artist",
-                value: item.creator,
-                inline: true,
-              },
-              {
-                name: "Credit & source",
-                value: `[Open on DeviantArt](${item.sourceUrl})`,
-                inline: false,
-              },
+              { name: "Artist", value: item.creator, inline: true },
+              { name: "Credit & source", value: `[Open on DeviantArt](${item.sourceUrl})`, inline: false },
             ];
-          
-            if (item.published) {
-              fields.splice(1, 0, {
-                name: "Published",
-                value: cleanText(item.published, 100),
-                inline: true,
-              });
-            }
-          
+            if (item.published) fields.splice(1, 0, { name: "Published", value: cleanText(item.published, 100), inline: true });
+
             return {
-              embeds: [
-                {
-                  title: item.title || "DeviantArt artwork",
-                  url: item.sourceUrl,
-                  description: `Search: \`${cleanText(searchText, 80)}\``,
-                  fields,
-                  image: { url: item.imageUrl },
-                  footer: {
-                    text: "DeviantArt public RSS • best-effort mature filtering",
-                  },
-                },
-              ],
-              components: [
-                {
-                  type: 1,
-                  components: [
-                    {
-                      type: 2,
-                      style: 1,
-                      custom_id: `another:${encodedTerms}`,
-                      label: "Another result",
-                      emoji: { name: "🔄" },
-                    },
-                    {
-                      type: 2,
-                      style: 5,
-                      url: item.sourceUrl,
-                      label: "Open post",
-                    },
-                  ],
-                },
-              ],
+              embeds: [{
+                title: item.title || "DeviantArt artwork",
+                url: item.sourceUrl,
+                description: `Search: \`${cleanText(searchText, 80)}\``,
+                fields,
+                image: { url: item.imageUrl },
+                footer: { text: `DeviantArt result • ${route ?? "reader fallback"} • best-effort mature filtering` },
+              }],
+              components: [{
+                type: 1,
+                components: [
+                  { type: 2, style: 1, custom_id: `another:${encodedTerms}`, label: "Another result", emoji: { name: "🔄" } },
+                  { type: 2, style: 5, url: item.sourceUrl, label: "Open post" },
+                ],
+              }],
               allowed_mentions: { parse: [] },
             };
           }
-          
+
           async function searchAndBuild(terms) {
-            const item = await findArtwork(terms);
-            if (!item) return null;
-            return buildArtworkMessage(item, terms);
+            const result = await findArtwork(terms);
+            return buildArtworkMessage(result.item, terms, result.route);
           }
-          
-          async function handleCommand(interaction) {
-            if (interaction?.data?.name !== "furry") {
-              return ephemeralMessage("Unknown command.");
+
+          async function editOriginalInteraction(interaction, data) {
+            const applicationId = interaction?.application_id;
+            const token = interaction?.token;
+            if (!applicationId || !token) throw new Error("Discord interaction is missing application_id or token");
+            const endpoint = `https://discord.com/api/v10/webhooks/${applicationId}/${token}/messages/@original`;
+            const response = await fetch(endpoint, {
+              method: "PATCH",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify(data),
+            });
+            if (!response.ok) {
+              const body = await response.text();
+              throw new Error(`Discord follow-up edit failed (${response.status}): ${body.slice(0, 300)}`);
             }
-          
-            const queryOption = interaction?.data?.options?.find((option) => option.name === "query");
-            const query = String(queryOption?.value ?? "");
-            const { terms, blocked } = tokenizeQuery(query);
-          
-            if (blocked) {
-              return ephemeralMessage(
-                "This app only searches for filtered artwork. Try `blue wolf forest` instead.",
-              );
-            }
-          
-            if (terms.length === 0) {
-              return ephemeralMessage(
-                "Give me useful search words, such as `cute fox`, `dragon armor`, or `blue wolf forest`.",
-              );
-            }
-          
+          }
+
+          async function processSearch(interaction, terms) {
             try {
               const message = await searchAndBuild(terms);
-              if (!message) {
-                return ephemeralMessage(
-                  `No filtered DeviantArt RSS result was found for \`${cleanText(terms.join(" "), 80)}\`. Try fewer or simpler words.`,
-                );
-              }
-          
-              return json({
-                type: RESPONSE.CHANNEL_MESSAGE_WITH_SOURCE,
-                data: message,
-              });
+              await editOriginalInteraction(interaction, message);
             } catch (error) {
-              console.error("Artwork RSS search failed", error);
+              console.error("DeviantArt reader search failed", error);
               const status = Number(error?.status ?? 0);
-              if (status === 403) {
-                return ephemeralMessage(
-                  "DeviantArt blocked its RSS feed from this server. Open `/debug/rss` in the Worker URL to confirm the response.",
-                );
-              }
-              if (status === 429) {
-                return ephemeralMessage("DeviantArt is temporarily rate-limiting its RSS feed. Try again shortly.");
-              }
-              return ephemeralMessage("DeviantArt RSS did not respond correctly. Please try again shortly.");
+              let content = "DeviantArt could not be reached through either the direct feed or the reader fallback. Try again shortly.";
+              if (status === 429) content = "The DeviantArt reader fallback is temporarily rate-limiting requests. Try again in a minute.";
+              await editOriginalInteraction(interaction, { content, embeds: [], components: [], allowed_mentions: { parse: [] } });
             }
           }
-          
-          async function handleComponent(interaction) {
+
+          function handleCommand(interaction, ctx) {
+            if (interaction?.data?.name !== "furry") return ephemeralMessage("Unknown command.");
+
+            const queryOption = interaction?.data?.options?.find((option) => option.name === "query");
+            const { terms, blocked } = tokenizeQuery(String(queryOption?.value ?? ""));
+            if (blocked) return ephemeralMessage("This app only searches for filtered artwork. Try `blue wolf forest` instead.");
+            if (terms.length === 0) return ephemeralMessage("Give me useful search words, such as `cute fox`, `dragon armor`, or `blue wolf forest`.");
+
+            ctx.waitUntil(processSearch(interaction, terms));
+            return json({ type: RESPONSE.DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE });
+          }
+
+          function handleComponent(interaction, ctx) {
             const customId = String(interaction?.data?.custom_id ?? "");
-            if (!customId.startsWith("another:")) {
-              return ephemeralMessage("Unknown button.");
-            }
-          
+            if (!customId.startsWith("another:")) return ephemeralMessage("Unknown button.");
+
             let decoded = "";
-            try {
-              decoded = decodeURIComponent(customId.slice("another:".length));
-            } catch {
-              decoded = "";
-            }
-          
+            try { decoded = decodeURIComponent(customId.slice("another:".length)); } catch {}
             const terms = decoded.split(/\s+/).filter(Boolean).slice(0, 6);
-            if (terms.length === 0) {
-              return ephemeralMessage("The saved search was invalid. Run `/furry` again.");
-            }
-          
-            try {
-              const message = await searchAndBuild(terms);
-              if (!message) {
-                return ephemeralMessage("No other filtered DeviantArt RSS result was found for that search.");
-              }
-          
-              return json({
-                type: RESPONSE.UPDATE_MESSAGE,
-                data: message,
-              });
-            } catch (error) {
-              console.error("Artwork RSS refresh failed", error);
-              return ephemeralMessage("DeviantArt RSS did not respond correctly. Please try again shortly.");
-            }
+            if (terms.length === 0) return ephemeralMessage("The saved search was invalid. Run `/furry` again.");
+
+            ctx.waitUntil(processSearch(interaction, terms));
+            return json({ type: RESPONSE.DEFERRED_UPDATE_MESSAGE });
           }
-          
-          async function runRssDiagnostics(request) {
+
+          async function runDiagnostics(request) {
             const url = new URL(request.url);
             const requested = cleanText(url.searchParams.get("q") ?? "blue wolf", 80);
             const { terms } = tokenizeQuery(requested);
@@ -604,110 +704,68 @@ jobs:
             const report = {
               ok: false,
               generated_at: new Date().toISOString(),
-              source: "DeviantArt public RSS",
+              source: "DeviantArt with direct RSS and Jina Reader fallback",
               query: safeTerms.join(" "),
               tests: [],
             };
-          
-            const settled = await Promise.allSettled(searches.map(requestRssFeed));
-            for (let index = 0; index < settled.length; index += 1) {
-              const result = settled[index];
-              const search = searches[index];
-              if (result.status === "fulfilled") {
-                report.tests.push({
-                  name: search.label,
-                  ok: true,
-                  status: result.value.status,
-                  content_type: result.value.contentType,
-                  parsed_items: result.value.items.length,
-                  sample_titles: result.value.items.slice(0, 3).map((item) => item.title),
-                  feed_url: search.url.toString(),
-                });
-              } else {
-                report.tests.push({
-                  name: search.label,
-                  ok: false,
-                  status: Number(result.reason?.status ?? 0),
-                  error: cleanText(result.reason?.message ?? result.reason, 200),
-                  body_preview: cleanText(result.reason?.bodyPreview ?? "", 180) || undefined,
-                  feed_url: search.url.toString(),
-                });
+
+            for (const search of searches) {
+              for (const [route, requester] of [["direct-rss", requestDirectRss], ["reader-rss", requestRssThroughReader]]) {
+                try {
+                  const result = await requester(search);
+                  report.tests.push({ name: `${search.label}:${route}`, ok: true, status: result.status, content_type: result.contentType, parsed_items: result.items.length, sample_titles: result.items.slice(0, 3).map((item) => item.title), target_url: search.url.toString() });
+                } catch (error) {
+                  report.tests.push({ name: `${search.label}:${route}`, ok: false, status: Number(error?.status ?? 0), error: cleanText(error?.message ?? error, 200), body_preview: cleanText(error?.bodyPreview ?? "", 180) || undefined, target_url: search.url.toString() });
+                }
               }
             }
-          
+
+            try {
+              const page = await requestSearchPageThroughReader(safeTerms);
+              report.tests.push({ name: "search-page:reader", ok: true, status: page.status, content_type: page.contentType, parsed_items: page.items.length, sample_titles: page.items.slice(0, 3).map((item) => item.title), target_url: page.targetUrl.toString() });
+            } catch (error) {
+              report.tests.push({ name: "search-page:reader", ok: false, status: Number(error?.status ?? 0), error: cleanText(error?.message ?? error, 200), body_preview: cleanText(error?.bodyPreview ?? "", 180) || undefined, target_url: buildSearchPageUrl(safeTerms).toString() });
+            }
+
             report.ok = report.tests.some((test) => test.ok && test.parsed_items > 0);
             return report;
           }
-          
-          // Kept only so replacing the previous Durable Object deployment does not need
-          // a destructive migration. The RSS build does not read or write this object.
+
           export class DeviantArtTokenVault {
-            constructor(state, env) {
-              this.state = state;
-              this.env = env;
-            }
-          
-            async fetch() {
-              return json({ ok: true, unused: true, source: "DeviantArt RSS build" });
-            }
+            constructor(state, env) { this.state = state; this.env = env; }
+            async fetch() { return json({ ok: true, unused: true, source: "DeviantArt reader-fallback build" }); }
           }
-          
+
           export default {
-            async fetch(request, env) {
+            async fetch(request, env, ctx) {
               const requestUrl = new URL(request.url);
-          
-              if (request.method === "GET" && requestUrl.pathname === "/debug/rss") {
-                return json(await runRssDiagnostics(request));
-              }
-          
+
+              if (request.method === "GET" && requestUrl.pathname === "/debug/deviantart") return json(await runDiagnostics(request));
+              if (request.method === "GET" && requestUrl.pathname === "/debug/rss") return json(await runDiagnostics(request));
               if (request.method === "GET") {
                 return new Response(
-                  "Furry Art Finder is online and using DeviantArt public RSS. Open /debug/rss?q=blue%20wolf to test the feed.",
+                  "Furry Art Finder is online and using DeviantArt through a reader fallback. Open /debug/deviantart?q=blue%20wolf to test it.",
                   { headers: { "content-type": "text/plain; charset=UTF-8" } },
                 );
               }
-          
-              if (request.method !== "POST") {
-                return new Response("Method Not Allowed", { status: 405 });
-              }
-          
-              if (!env.DISCORD_PUBLIC_KEY) {
-                console.error("DISCORD_PUBLIC_KEY is not configured");
-                return new Response("Server is not configured", { status: 500 });
-              }
-          
+
+              if (request.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
+              if (!env.DISCORD_PUBLIC_KEY) return new Response("Server is not configured", { status: 500 });
+
               const signature = request.headers.get("x-signature-ed25519");
               const timestamp = request.headers.get("x-signature-timestamp");
               const rawBody = await request.text();
-          
-              if (!signature || !timestamp) {
-                return new Response("Missing Discord signature", { status: 401 });
-              }
-          
+              if (!signature || !timestamp) return new Response("Missing Discord signature", { status: 401 });
+
               const valid = await verifyKey(rawBody, signature, timestamp, env.DISCORD_PUBLIC_KEY);
-              if (!valid) {
-                return new Response("Invalid request signature", { status: 401 });
-              }
-          
+              if (!valid) return new Response("Invalid request signature", { status: 401 });
+
               let interaction;
-              try {
-                interaction = JSON.parse(rawBody);
-              } catch {
-                return new Response("Invalid JSON", { status: 400 });
-              }
-          
-              if (interaction.type === INTERACTION.PING) {
-                return json({ type: RESPONSE.PONG });
-              }
-          
-              if (interaction.type === INTERACTION.APPLICATION_COMMAND) {
-                return handleCommand(interaction);
-              }
-          
-              if (interaction.type === INTERACTION.MESSAGE_COMPONENT) {
-                return handleComponent(interaction);
-              }
-          
+              try { interaction = JSON.parse(rawBody); } catch { return new Response("Invalid JSON", { status: 400 }); }
+
+              if (interaction.type === INTERACTION.PING) return json({ type: RESPONSE.PONG });
+              if (interaction.type === INTERACTION.APPLICATION_COMMAND) return handleCommand(interaction, ctx);
+              if (interaction.type === INTERACTION.MESSAGE_COMPONENT) return handleComponent(interaction, ctx);
               return ephemeralMessage("Unsupported Discord interaction.");
             },
           };
@@ -729,7 +787,7 @@ jobs:
             {
               name: "furry",
               type: 1,
-              description: "Find filtered furry artwork from DeviantArt public RSS",
+              description: "Find filtered furry artwork from DeviantArt",
               nsfw: false,
               integration_types: [1],
               contexts: [0, 1, 2],
@@ -767,7 +825,7 @@ jobs:
               `https://discord.com/api/v10/applications/${applicationId}/commands`,
               commands,
             );
-            console.log("Registered /furry globally for User Install with DeviantArt RSS.");
+            console.log("Registered /furry globally for User Install with DeviantArt reader fallback.");
           
             if (legacyGuildId) {
               await putCommands(
@@ -807,3 +865,4 @@ jobs:
         env:
           DISCORD_APPLICATION_ID: ${{ secrets.DISCORD_APPLICATION_ID }}
           DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          
