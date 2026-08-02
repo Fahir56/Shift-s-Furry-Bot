@@ -1,22 +1,24 @@
-name: Deploy Furry Art Discord App (DeviantArt Reader Fallback)
+name: Deploy Shift Furry Bot (Safe + NSFW)
 
 on:
   workflow_dispatch:
   push:
     branches:
       - main
+    paths:
+      - ".github/workflows/deploy.yml"
 
 permissions:
   contents: read
 
 concurrency:
-  group: furry-art-user-app-production
+  group: shift-furry-production
   cancel-in-progress: true
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
 
     steps:
       - name: Check out repository
@@ -30,103 +32,80 @@ jobs:
       - name: Generate application files
         shell: bash
         run: |
-          mkdir -p src scripts
-
-          cat > package.json <<'PACKAGE_EOF'
+          set -euo pipefail
+          mkdir -p api lib scripts
+          cat > package.json <<'__PACKAGE_JSON_EOF__'
           {
-            "name": "furry-art-discord-user-app",
-            "version": "5.0.0",
+            "name": "shift-furry-safe-nsfw",
+            "version": "1.0.0",
             "private": true,
             "type": "module",
-            "description": "A user-installed Discord app that searches DeviantArt through direct RSS and a reader fallback.",
+            "description": "Discord user-installed furry image search with separate safe and age-restricted commands.",
             "scripts": {
-              "check": "node --check src/index.js && node --check scripts/register-commands.js",
-              "deploy": "wrangler deploy",
-              "register": "node scripts/register-commands.js"
+              "check": "node --check api/interactions.js && node --check api/health.js && node --check api/status.js && node --check lib/e6.js && node --check scripts/configure-discord.js",
+              "configure-discord": "node scripts/configure-discord.js"
             },
             "dependencies": {
+              "@vercel/functions": "latest",
               "discord-interactions": "4.4.0"
             },
             "devDependencies": {
-              "wrangler": "4.114.0"
+              "vercel": "latest"
             },
             "engines": {
               "node": ">=22"
             }
           }
-          PACKAGE_EOF
-
-          cat > wrangler.jsonc <<'WRANGLER_EOF'
+          __PACKAGE_JSON_EOF__
+          cat > vercel.json <<'__VERCEL_JSON_EOF__'
           {
-            "$schema": "node_modules/wrangler/config-schema.json",
-            "name": "furry-art-finder-app",
-            "main": "src/index.js",
-            "compatibility_date": "2026-08-02",
-            "compatibility_flags": ["nodejs_compat"],
-            "workers_dev": true,
-            "durable_objects": {
-              "bindings": [
-                {
-                  "name": "DEVIANTART_TOKEN_VAULT",
-                  "class_name": "DeviantArtTokenVault"
-                }
-              ]
-            },
-            "exports": {
-              "DeviantArtTokenVault": {
-                "type": "durable-object",
-                "storage": "sqlite"
+            "$schema": "https://openapi.vercel.sh/vercel.json",
+            "regions": [
+              "iad1"
+            ],
+            "functions": {
+              "api/*.js": {
+                "maxDuration": 60
               }
             },
-            "observability": {
-              "enabled": true,
-              "logs": {
-                "invocation_logs": true,
-                "head_sampling_rate": 1
+            "rewrites": [
+              {
+                "source": "/",
+                "destination": "/api/status"
+              },
+              {
+                "source": "/health",
+                "destination": "/api/health"
               }
-            }
+            ]
           }
-          WRANGLER_EOF
-
-          cat > src/index.js <<'WORKER_EOF'
+          __VERCEL_JSON_EOF__
+          cat > api/interactions.js <<'__API_INTERACTIONS_JS_EOF__'
+          import { waitUntil } from "@vercel/functions";
           import { verifyKey } from "discord-interactions";
-
+          import {
+            buildArtworkMessage,
+            cleanText,
+            decodeButtonData,
+            findArtwork,
+            parseQuery,
+          } from "../lib/e6.js";
+          
           const INTERACTION = Object.freeze({
             PING: 1,
             APPLICATION_COMMAND: 2,
             MESSAGE_COMPONENT: 3,
           });
-
+          
           const RESPONSE = Object.freeze({
             PONG: 1,
             CHANNEL_MESSAGE_WITH_SOURCE: 4,
             DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE: 5,
             DEFERRED_UPDATE_MESSAGE: 6,
           });
-
+          
           const EPHEMERAL = 1 << 6;
-          const RSS_URL = "https://backend.deviantart.com/rss.xml";
-          const DEVIANTART_SEARCH_URL = "https://www.deviantart.com/search/deviations";
-          const JINA_READER_PREFIX = "https://r.jina.ai/";
-          const USER_AGENT =
-            "ShiftFurrySearch/5.0 (Discord user app; DeviantArt reader fallback)";
-
-          const STOP_WORDS = new Set([
-            "a", "an", "and", "art", "artwork", "drawing", "furry", "for",
-            "from", "in", "of", "on", "picture", "please", "show", "the",
-            "to", "with",
-          ]);
-
-          const BLOCKED_WORDS = new Set([
-            "adult", "explicit", "fetish", "naked", "nude", "nsfw", "porn",
-            "pornographic", "sex", "sexual", "yiff",
-          ]);
-
-          const UNSAFE_RESULT_PATTERN = new RegExp(
-            String.raw`\b(adult|explicit|fetish|naked|nudity|nude|nsfw|porn|pornographic|sex|sexual|sexy|yiff|18\+|mature content|gore|guro|vore|inflation|pregnant|pregnancy|diaper|feet fetish|bondage|bdsm)\b`,
-            "i",
-          );
-
+          
           function json(data, status = 200) {
             return new Response(JSON.stringify(data), {
               status,
@@ -136,733 +115,812 @@ jobs:
               },
             });
           }
-
-          function ephemeralMessage(content) {
+          
+          function immediateEphemeral(content) {
             return json({
               type: RESPONSE.CHANNEL_MESSAGE_WITH_SOURCE,
-              data: { content, flags: EPHEMERAL },
+              data: {
+                content,
+                flags: EPHEMERAL,
+                allowed_mentions: { parse: [] },
+              },
             });
           }
-
-          function cleanText(value, maxLength) {
+          
+          async function editOriginalResponse(interaction, message) {
+            const appId = interaction.application_id;
+            const token = interaction.token;
+            const response = await fetch(
+              `https://discord.com/api/v10/webhooks/${appId}/${token}/messages/@original`,
+              {
+                method: "PATCH",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify(message),
+              },
+            );
+          
+            if (!response.ok) {
+              const body = await response.text();
+              throw new Error(
+                `Discord response edit failed (${response.status}): ${body.slice(0, 300)}`,
+              );
+            }
+          }
+          
+          function errorMessage(error) {
+            const status = Number(error?.status ?? 0);
+            if (status === 403) {
+              return "The artwork site blocked this host. Open `/health` on the deployed URL to see which source failed.";
+            }
+            if (status === 429) {
+              return "The artwork site is rate-limiting requests. Wait a moment and try again.";
+            }
+            return "The artwork source did not respond correctly. Try again shortly.";
+          }
+          
+          async function finishSearch(interaction, mode, tags) {
+            try {
+              const post = await findArtwork(mode, tags);
+              const message = post
+                ? buildArtworkMessage(post, mode, tags)
+                : {
+                    content:
+                      `No ${mode === "nsfw" ? "age-restricted" : "safe"} result was found for ` +
+                      `\`${cleanText(tags.join(" ").replaceAll("_", " "), 80)}\`. Try fewer tags.`,
+                    embeds: [],
+                    components: [],
+                    allowed_mentions: { parse: [] },
+                  };
+              await editOriginalResponse(interaction, message);
+            } catch (error) {
+              console.error("Artwork search failed", error);
+              try {
+                await editOriginalResponse(interaction, {
+                  content: errorMessage(error),
+                  embeds: [],
+                  components: [],
+                  allowed_mentions: { parse: [] },
+                });
+              } catch (editError) {
+                console.error("Could not edit deferred Discord response", editError);
+              }
+            }
+          }
+          
+          function commandMode(name) {
+            if (name === "furry") return "safe";
+            if (name === "furry-nsfw") return "nsfw";
+            return null;
+          }
+          
+          export default {
+            async fetch(request) {
+              if (request.method === "GET") {
+                return json({
+                  ok: true,
+                  service: "Shift's Furry Search",
+                  commands: ["/furry", "/furry-nsfw"],
+                  endpoint: "/api/interactions",
+                });
+              }
+          
+              if (request.method !== "POST") {
+                return new Response("Method Not Allowed", { status: 405 });
+              }
+          
+              const publicKey = process.env.DISCORD_PUBLIC_KEY;
+              if (!publicKey) {
+                console.error("DISCORD_PUBLIC_KEY is not configured");
+                return new Response("Server is not configured", { status: 500 });
+              }
+          
+              const signature = request.headers.get("x-signature-ed25519");
+              const timestamp = request.headers.get("x-signature-timestamp");
+              const rawBody = await request.text();
+          
+              if (!signature || !timestamp) {
+                return new Response("Missing Discord signature", { status: 401 });
+              }
+          
+              const valid = await verifyKey(rawBody, signature, timestamp, publicKey);
+              if (!valid) {
+                return new Response("Invalid request signature", { status: 401 });
+              }
+          
+              let interaction;
+              try {
+                interaction = JSON.parse(rawBody);
+              } catch {
+                return new Response("Invalid JSON", { status: 400 });
+              }
+          
+              if (interaction.type === INTERACTION.PING) {
+                return json({ type: RESPONSE.PONG });
+              }
+          
+              if (interaction.type === INTERACTION.APPLICATION_COMMAND) {
+                const mode = commandMode(interaction?.data?.name);
+                if (!mode) return immediateEphemeral("Unknown command.");
+          
+                const queryOption = interaction?.data?.options?.find(
+                  (option) => option.name === "query",
+                );
+                const parsed = parseQuery(queryOption?.value ?? "");
+          
+                if (parsed.blocked) {
+                  const reason = parsed.reason === "underage"
+                    ? "Underage-related searches are never allowed."
+                    : "Search operators such as `rating:` and `order:` are controlled by the app.";
+                  return immediateEphemeral(reason);
+                }
+                if (parsed.tags.length === 0) {
+                  return immediateEphemeral(
+                    "Give me useful tags, such as `blue wolf`, `dragon armor`, or `fox forest`.",
+                  );
+                }
+          
+                waitUntil(finishSearch(interaction, mode, parsed.tags));
+                return json({
+                  type: RESPONSE.DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE,
+                  data: { flags: EPHEMERAL },
+                });
+              }
+          
+              if (interaction.type === INTERACTION.MESSAGE_COMPONENT) {
+                const decoded = decodeButtonData(interaction?.data?.custom_id);
+                if (!decoded) {
+                  return immediateEphemeral("That saved search is invalid. Run the slash command again.");
+                }
+          
+                waitUntil(finishSearch(interaction, decoded.mode, decoded.tags));
+                return json({ type: RESPONSE.DEFERRED_UPDATE_MESSAGE });
+              }
+          
+              return immediateEphemeral("Unsupported Discord interaction.");
+            },
+          };
+          __API_INTERACTIONS_JS_EOF__
+          cat > api/health.js <<'__API_HEALTH_JS_EOF__'
+          import { diagnostics } from "../lib/e6.js";
+          
+          export default {
+            async fetch(request) {
+              const url = new URL(request.url);
+              const report = await diagnostics(url.searchParams.get("q") ?? "blue wolf");
+              return new Response(JSON.stringify(report), {
+                status: report.ok ? 200 : 502,
+                headers: {
+                  "content-type": "application/json; charset=UTF-8",
+                  "cache-control": "no-store",
+                },
+              });
+            },
+          };
+          __API_HEALTH_JS_EOF__
+          cat > api/status.js <<'__API_STATUS_JS_EOF__'
+          export default {
+            fetch() {
+              return new Response(
+                "Shift's Furry Search is online. Safe: /furry. Age-restricted: /furry-nsfw. Source check: /health?q=blue%20wolf",
+                {
+                  headers: {
+                    "content-type": "text/plain; charset=UTF-8",
+                    "cache-control": "no-store",
+                  },
+                },
+              );
+            },
+          };
+          __API_STATUS_JS_EOF__
+          cat > lib/e6.js <<'__LIB_E6_JS_EOF__'
+          const SAFE_API = "https://e926.net/posts.json";
+          const NSFW_API = "https://e621.net/posts.json";
+          const USER_AGENT =
+            "ShiftFurrySearch/7.0 (Discord user app; source code on github.com/Fahir56/Shift-s-Furry-Bot)";
+          
+          const MAX_QUERY_LENGTH = 55;
+          const CACHE_TTL_MS = 45_000;
+          const cache = new Map();
+          
+          const STOP_WORDS = new Set([
+            "a", "an", "and", "art", "artwork", "drawing", "furry", "for", "from",
+            "in", "of", "on", "picture", "please", "show", "the", "to", "with",
+          ]);
+          
+          const DISALLOWED_QUERY_PREFIXES = [
+            "rating:", "order:", "status:", "id:", "user:", "approver:", "uploader:",
+            "parent:", "child:", "pool:", "set:", "md5:", "source:", "date:", "score:",
+            "favcount:", "comment_count:", "note_count:", "width:", "height:", "filesize:",
+            "duration:", "ratio:", "limit:",
+          ];
+          
+          const UNDERAGE_WORDS = new Set([
+            "cub", "cubs", "child", "children", "kid", "kids", "minor", "minors",
+            "underage", "young", "youth", "teen", "teenager", "teenagers", "loli",
+            "lolicon", "shota", "shotacon", "aged_down", "age_regression",
+          ]);
+          
+          const UNDERAGE_NEGATIVE_TAGS = [
+            "-cub", "-young", "-underage", "-child", "-minor", "-loli", "-shota",
+            "-teenager", "-aged_down", "-age_regression",
+          ];
+          
+          const RESULT_UNDERAGE_TAGS = new Set([
+            "cub", "young", "underage", "child", "minor", "loli", "shota", "teenager",
+            "aged_down", "age_regression",
+          ]);
+          
+          function cleanText(value, maxLength = 200) {
             return String(value ?? "")
               .replace(/[\u0000-\u001F\u007F]/g, " ")
               .replace(/\s+/g, " ")
               .trim()
               .slice(0, maxLength);
           }
-
-          function tokenizeQuery(input) {
-            const raw = cleanText(input, 80).toLowerCase();
-            if (!raw) return { terms: [], blocked: false };
-
-            const pieces = raw.match(/"[^"]+"|'[^']+'|\S+/g) ?? [];
-            const terms = [];
+          
+          function normalizePiece(value) {
+            return String(value ?? "")
+              .normalize("NFKD")
+              .toLowerCase()
+              .replace(/[^a-z0-9_()\-:]/g, "")
+              .replace(/_{2,}/g, "_")
+              .slice(0, 40);
+          }
+          
+          export function parseQuery(input) {
+            const raw = cleanText(input, MAX_QUERY_LENGTH);
+            if (!raw) return { tags: [], display: "", blocked: false, reason: "empty" };
+          
+            const pieces = raw.split(/\s+/).map(normalizePiece).filter(Boolean);
+            const tags = [];
             let blocked = false;
-
+            let reason = "";
+          
             for (const piece of pieces) {
-              const withoutQuotes = piece.replace(/^["']|["']$/g, "");
-              const normalized = withoutQuotes
-                .normalize("NFKD")
-                .replace(/[^a-z0-9 _-]/g, "")
-                .replace(/[-_\s]+/g, " ")
-                .trim()
-                .slice(0, 35);
-
-              if (!normalized) continue;
-              const words = normalized.split(/\s+/);
-              if (words.some((word) => BLOCKED_WORDS.has(word))) {
+              const unsigned = piece.replace(/^-+/, "");
+              if (
+                DISALLOWED_QUERY_PREFIXES.some((prefix) => unsigned.startsWith(prefix)) ||
+                UNDERAGE_WORDS.has(unsigned)
+              ) {
                 blocked = true;
+                reason = UNDERAGE_WORDS.has(unsigned) ? "underage" : "meta";
                 continue;
               }
-
-              if (STOP_WORDS.has(normalized)) continue;
-              terms.push(normalized);
+          
+              if (STOP_WORDS.has(unsigned)) continue;
+              if (piece === "-" || piece.length < 2) continue;
+              tags.push(piece.replace(/^-+/, ""));
             }
-
-            return { terms: [...new Set(terms)].slice(0, 6), blocked };
+          
+            const unique = [...new Set(tags)].slice(0, 8);
+            return {
+              tags: unique,
+              display: unique.join(" ").replaceAll("_", " "),
+              blocked,
+              reason,
+            };
           }
-
-          function decodeXmlEntities(value) {
-            return String(value ?? "")
-              .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, "$1")
-              .replace(/&#x([0-9a-f]+);/gi, (_, hex) => {
-                const codePoint = Number.parseInt(hex, 16);
-                return Number.isFinite(codePoint) ? String.fromCodePoint(codePoint) : _;
-              })
-              .replace(/&#(\d+);/g, (_, decimal) => {
-                const codePoint = Number.parseInt(decimal, 10);
-                return Number.isFinite(codePoint) ? String.fromCodePoint(codePoint) : _;
-              })
-              .replace(/&quot;/g, '"')
-              .replace(/&apos;/g, "'")
-              .replace(/&lt;/g, "<")
-              .replace(/&gt;/g, ">")
-              .replace(/&amp;/g, "&");
+          
+          function getAllPostTags(post) {
+            const groups = post?.tags && typeof post.tags === "object"
+              ? Object.values(post.tags)
+              : [];
+            return groups.flatMap((group) => Array.isArray(group) ? group : []);
           }
-
-          function stripHtml(value) {
-            return cleanText(
-              decodeXmlEntities(value)
-                .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, " ")
-                .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, " ")
-                .replace(/<[^>]+>/g, " "),
-              1000,
+          
+          function hasUnderageTags(post) {
+            return getAllPostTags(post).some((tag) =>
+              RESULT_UNDERAGE_TAGS.has(String(tag).toLowerCase())
             );
           }
-
-          function extractTag(block, tagName) {
-            const escaped = tagName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-            const match = block.match(new RegExp(`<${escaped}(?:\\s[^>]*)?>([\\s\\S]*?)<\\/${escaped}>`, "i"));
-            return match ? decodeXmlEntities(match[1]).trim() : "";
-          }
-
-          function extractAllTags(block, tagName) {
-            const escaped = tagName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-            const regex = new RegExp(`<${escaped}(?:\\s[^>]*)?>([\\s\\S]*?)<\\/${escaped}>`, "gi");
-            const values = [];
-            for (const match of block.matchAll(regex)) values.push(stripHtml(match[1]));
-            return values.filter(Boolean);
-          }
-
-          function extractAttribute(tag, attributeName) {
-            const escaped = attributeName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-            const match = tag.match(new RegExp(`\\b${escaped}\\s*=\\s*(["'])([\\s\\S]*?)\\1`, "i"));
-            return match ? decodeXmlEntities(match[2]).trim() : "";
-          }
-
-          function collectAttributeUrls(block, tagName, attributeName) {
-            const escapedTag = tagName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-            const regex = new RegExp(`<${escapedTag}\\b[^>]*>`, "gi");
-            const urls = [];
-            for (const match of block.matchAll(regex)) {
-              const value = extractAttribute(match[0], attributeName);
-              if (value) urls.push(value);
-            }
-            return urls;
-          }
-
-          function isHttpsUrl(value) {
-            if (typeof value !== "string" || !value.startsWith("https://")) return false;
-            try {
-              return new URL(value).protocol === "https:";
-            } catch {
-              return false;
-            }
-          }
-
-          function isDeviantArtPage(value) {
-            if (!isHttpsUrl(value)) return false;
-            try {
-              const hostname = new URL(value).hostname.toLowerCase();
-              return hostname === "deviantart.com" || hostname === "www.deviantart.com" || hostname.endsWith(".deviantart.com");
-            } catch {
-              return false;
-            }
-          }
-
-          function isLikelyArtworkImage(value) {
-            if (!isHttpsUrl(value)) return false;
-            try {
-              const url = new URL(value);
-              const host = url.hostname.toLowerCase();
-              const path = url.pathname.toLowerCase();
-              if (host.includes("deviantart.net") || host.includes("wixmp.com")) return true;
-              return /\.(?:jpe?g|png|gif|webp)(?:$|\?)/i.test(`${path}${url.search}`);
-            } catch {
-              return false;
-            }
-          }
-
-          function creatorFromSourceUrl(sourceUrl) {
-            try {
-              const first = new URL(sourceUrl).pathname.split("/").filter(Boolean)[0];
-              if (first && !["art", "deviation", "gallery", "tag", "search"].includes(first.toLowerCase())) return first;
-            } catch {}
-            return "Unknown artist";
-          }
-
-          function parseRssItems(xmlLike) {
-            const variants = [
-              String(xmlLike ?? ""),
-              decodeXmlEntities(xmlLike),
-              decodeXmlEntities(String(xmlLike ?? "").replace(/<br\s*\/?>/gi, "\n")),
-            ];
-            const items = [];
-            const seen = new Set();
-
-            for (const xml of variants) {
-              const itemRegex = /<item\b[^>]*>([\s\S]*?)<\/item>/gi;
-              for (const match of xml.matchAll(itemRegex)) {
-                const block = match[1];
-                const title = stripHtml(extractTag(block, "title")) || "DeviantArt artwork";
-                const sourceUrl = extractTag(block, "link") || extractTag(block, "guid");
-                const descriptionRaw = extractTag(block, "description");
-                const description = stripHtml(descriptionRaw);
-                const categories = [
-                  ...extractAllTags(block, "category"),
-                  ...extractAllTags(block, "media:category"),
-                ];
-
-                const decodedDescription = decodeXmlEntities(descriptionRaw);
-                const imageCandidates = [
-                  ...collectAttributeUrls(block, "media:content", "url"),
-                  ...collectAttributeUrls(block, "media:thumbnail", "url"),
-                  ...collectAttributeUrls(block, "enclosure", "url"),
-                  ...collectAttributeUrls(decodedDescription, "img", "src"),
-                ].filter(isLikelyArtworkImage);
-
-                const creator = cleanText(
-                  extractTag(block, "media:credit") ||
-                  extractTag(block, "dc:creator") ||
-                  creatorFromSourceUrl(sourceUrl),
-                  100,
-                ) || "Unknown artist";
-
-                const published = cleanText(extractTag(block, "pubDate"), 100);
-                const imageUrl = imageCandidates[0] ?? null;
-                const safetyText = `${title} ${description} ${categories.join(" ")} ${sourceUrl} ${imageUrl}`;
-
-                if (!isDeviantArtPage(sourceUrl) || !imageUrl || UNSAFE_RESULT_PATTERN.test(safetyText)) continue;
-                const identity = `${sourceUrl}\n${imageUrl}`;
-                if (seen.has(identity)) continue;
-                seen.add(identity);
-                items.push({
-                  title: cleanText(title, 200),
-                  sourceUrl,
-                  imageUrl,
-                  creator,
-                  description: cleanText(description, 350),
-                  categories: categories.slice(0, 20),
-                  published,
-                });
+          
+          function usableImageUrl(post) {
+            const candidates = [post?.file?.url, post?.sample?.url, post?.preview?.url];
+            for (const value of candidates) {
+              if (typeof value !== "string" || !value.startsWith("https://")) continue;
+              let pathname = "";
+              try {
+                pathname = new URL(value).pathname.toLowerCase();
+              } catch {
+                continue;
               }
-              if (items.length > 0) break;
+              if (/\.(jpe?g|png|gif|webp)$/i.test(pathname)) return value;
             }
-
-            return items;
+            return null;
           }
-
-          function parseReaderMarkdown(markdown) {
-            const text = String(markdown ?? "");
-            const images = [];
-            const links = [];
-
-            for (const match of text.matchAll(/!\[([^\]]*)\]\((https:\/\/[^)\s]+)\)/g)) {
-              if (isLikelyArtworkImage(match[2])) images.push({ index: match.index ?? 0, alt: cleanText(match[1], 200), url: match[2] });
+          
+          function postIsUsable(post, mode) {
+            if (!post || hasUnderageTags(post) || post?.flags?.deleted === true) return false;
+            const rating = String(post?.rating ?? "").toLowerCase();
+            if (mode === "safe" && rating !== "s") return false;
+            if (mode === "nsfw" && !["q", "e"].includes(rating)) return false;
+            return Boolean(usableImageUrl(post));
+          }
+          
+          function cacheKey(mode, tags, page) {
+            return `${mode}|${page}|${tags.join(" ")}`;
+          }
+          
+          function readCache(key) {
+            const hit = cache.get(key);
+            if (!hit) return null;
+            if (Date.now() - hit.savedAt > CACHE_TTL_MS) {
+              cache.delete(key);
+              return null;
             }
-
-            for (const match of text.matchAll(/\[([^\]]*)\]\((https:\/\/[^)\s]+)\)/g)) {
-              const url = match[2];
-              if (!isDeviantArtPage(url)) continue;
-              let path = "";
-              try { path = new URL(url).pathname.toLowerCase(); } catch {}
-              if (!path.includes("/art/") && !path.includes("/deviation/")) continue;
-              links.push({ index: match.index ?? 0, title: cleanText(match[1], 200), url });
+            return hit.payload;
+          }
+          
+          function writeCache(key, payload) {
+            cache.set(key, { savedAt: Date.now(), payload });
+            if (cache.size > 100) {
+              const oldest = cache.keys().next().value;
+              cache.delete(oldest);
             }
-
-            const items = [];
-            const seen = new Set();
-            for (const image of images) {
-              const nearby = links
-                .map((link) => ({ link, distance: Math.abs(link.index - image.index) }))
-                .filter((entry) => entry.distance <= 2500)
-                .sort((a, b) => a.distance - b.distance)[0]?.link;
-              if (!nearby) continue;
-
-              const title = nearby.title || image.alt || "DeviantArt artwork";
-              const safetyText = `${title} ${image.alt} ${nearby.url} ${image.url}`;
-              if (UNSAFE_RESULT_PATTERN.test(safetyText)) continue;
-              const identity = `${nearby.url}\n${image.url}`;
-              if (seen.has(identity)) continue;
-              seen.add(identity);
-              items.push({
-                title: cleanText(title, 200),
-                sourceUrl: nearby.url,
-                imageUrl: image.url,
-                creator: cleanText(creatorFromSourceUrl(nearby.url), 100),
-                description: cleanText(image.alt, 350),
-                categories: [],
-                published: "",
+          }
+          
+          async function fetchJson(url) {
+            const response = await fetch(url, {
+              headers: {
+                accept: "application/json",
+                "user-agent": USER_AGENT,
+              },
+            });
+            const body = await response.text();
+          
+            if (!response.ok) {
+              const error = new Error(`Artwork API returned HTTP ${response.status}`);
+              error.status = response.status;
+              error.bodyPreview = body.slice(0, 250);
+              throw error;
+            }
+          
+            try {
+              return JSON.parse(body);
+            } catch {
+              const error = new Error("Artwork API returned invalid JSON");
+              error.status = 502;
+              error.bodyPreview = body.slice(0, 250);
+              throw error;
+            }
+          }
+          
+          async function requestPosts(mode, tags, page) {
+            const endpoint = mode === "safe" ? SAFE_API : NSFW_API;
+            const enforcedRating = mode === "safe" ? "rating:safe" : "-rating:safe";
+            const queryTags = [
+              ...tags,
+              enforcedRating,
+              ...UNDERAGE_NEGATIVE_TAGS,
+            ];
+          
+            const url = new URL(endpoint);
+            url.searchParams.set("tags", queryTags.join(" "));
+            url.searchParams.set("limit", "75");
+            url.searchParams.set("page", String(page));
+          
+            const key = cacheKey(mode, queryTags, page);
+            const cached = readCache(key);
+            if (cached) return cached;
+          
+            const payload = await fetchJson(url);
+            writeCache(key, payload);
+            return payload;
+          }
+          
+          export async function findArtwork(mode, tags) {
+            const firstPage = 1 + Math.floor(Math.random() * 4);
+            const pages = firstPage === 1 ? [1] : [firstPage, 1];
+            let lastError = null;
+          
+            for (const page of pages) {
+              try {
+                const payload = await requestPosts(mode, tags, page);
+                const posts = Array.isArray(payload?.posts) ? payload.posts : [];
+                const usable = posts.filter((post) => postIsUsable(post, mode));
+                if (usable.length > 0) {
+                  return usable[Math.floor(Math.random() * usable.length)];
+                }
+              } catch (error) {
+                lastError = error;
+                if (![403, 429, 500, 502, 503, 504].includes(Number(error?.status ?? 0))) {
+                  throw error;
+                }
+              }
+            }
+          
+            if (lastError) throw lastError;
+            return null;
+          }
+          
+          function ratingName(rating) {
+            return { s: "Safe", q: "Questionable", e: "Explicit" }[
+              String(rating ?? "").toLowerCase()
+            ] ?? "Unknown";
+          }
+          
+          function firstExternalSource(post) {
+            const sources = Array.isArray(post?.sources) ? post.sources : [];
+            return sources.find((source) => {
+              if (typeof source !== "string" || !source.startsWith("https://")) return false;
+              try {
+                const hostname = new URL(source).hostname.toLowerCase();
+                return !hostname.endsWith("e621.net") && !hostname.endsWith("e926.net");
+              } catch {
+                return false;
+              }
+            }) ?? null;
+          }
+          
+          function artistText(post) {
+            const artists = Array.isArray(post?.tags?.artist) ? post.tags.artist : [];
+            const meaningful = artists
+              .filter((artist) => !["conditional_dnp", "unknown_artist"].includes(artist))
+              .slice(0, 4)
+              .map((artist) => artist.replaceAll("_", " "));
+            return meaningful.length ? meaningful.join(", ") : "Unknown artist";
+          }
+          
+          function scoreText(post) {
+            const score = Number(post?.score?.total ?? 0);
+            const favorites = Number(post?.fav_count ?? 0);
+            return `Score ${score} • ${favorites} favorites`;
+          }
+          
+          function encodeButtonData(mode, tags) {
+            const modeCode = mode === "nsfw" ? "n" : "s";
+            const query = tags.join(" ").slice(0, MAX_QUERY_LENGTH);
+            return `another:${modeCode}:${encodeURIComponent(query)}`.slice(0, 100);
+          }
+          
+          export function buildArtworkMessage(post, mode, tags) {
+            const host = mode === "safe" ? "e926.net" : "e621.net";
+            const postUrl = `https://${host}/posts/${post.id}`;
+            const imageUrl = usableImageUrl(post);
+            const source = firstExternalSource(post);
+            const displayQuery = cleanText(tags.join(" ").replaceAll("_", " "), 80);
+            const rating = ratingName(post?.rating);
+            const title = `${mode === "nsfw" ? "Age-restricted" : "Safe"} furry artwork #${post.id}`;
+          
+            const fields = [
+              { name: "Artist", value: artistText(post), inline: true },
+              { name: "Rating", value: rating, inline: true },
+              { name: "Stats", value: scoreText(post), inline: true },
+              { name: "Search", value: `\`${displayQuery}\``, inline: false },
+            ];
+            if (source) {
+              fields.push({
+                name: "Artist/source link",
+                value: `[Open external source](${source})`,
+                inline: false,
               });
             }
-            return items;
-          }
-
-          function buildFeedUrl(searchExpression, offset = 0) {
-            const url = new URL(RSS_URL);
-            url.searchParams.set("type", "deviation");
-            url.searchParams.set("q", searchExpression);
-            url.searchParams.set("offset", String(offset));
-            url.searchParams.set("mature_content", "false");
-            return url;
-          }
-
-          function rssSearches(terms) {
-            const text = terms.join(" ");
-            return [
-              { label: "newest", url: buildFeedUrl(`sort:time furry ${text} meta:all`.trim(), 0) },
-              { label: "popular-week", url: buildFeedUrl(`boost:popular max_age:168h furry ${text} meta:all`.trim(), 0) },
-            ];
-          }
-
-          function buildSearchPageUrl(terms) {
-            const url = new URL(DEVIANTART_SEARCH_URL);
-            url.searchParams.set("q", `furry ${terms.join(" ")}`.trim());
-            return url;
-          }
-
-          function jinaUrl(targetUrl) {
-            return new URL(`${JINA_READER_PREFIX}${targetUrl.toString()}`);
-          }
-
-          async function fetchWithTimeout(url, options, timeoutMilliseconds) {
-            return fetch(url, { ...options, signal: AbortSignal.timeout(timeoutMilliseconds) });
-          }
-
-          async function requestDirectRss(search) {
-            let response;
-            try {
-              response = await fetchWithTimeout(search.url, {
-                headers: {
-                  accept: "application/rss+xml, application/xml;q=0.9, text/xml;q=0.8, */*;q=0.1",
-                  "user-agent": USER_AGENT,
-                },
-                redirect: "follow",
-              }, 2500);
-            } catch (error) {
-              const wrapped = new Error(`Direct DeviantArt RSS ${search.label} failed: ${error?.message ?? error}`);
-              wrapped.status = 0;
-              wrapped.label = search.label;
-              throw wrapped;
-            }
-
-            const body = await response.text();
-            if (!response.ok) {
-              const error = new Error(`Direct DeviantArt RSS returned HTTP ${response.status}`);
-              error.status = response.status;
-              error.label = search.label;
-              error.bodyPreview = body.slice(0, 180);
-              throw error;
-            }
-
-            const items = parseRssItems(body);
-            if (items.length === 0) {
-              const error = new Error("Direct DeviantArt RSS returned no parseable items");
-              error.status = response.status;
-              error.label = search.label;
-              error.bodyPreview = body.slice(0, 180);
-              throw error;
-            }
-
-            return { route: "direct-rss", label: search.label, status: response.status, contentType: response.headers.get("content-type"), items };
-          }
-
-          async function requestRssThroughReader(search) {
-            const readerUrl = jinaUrl(search.url);
-            let response;
-            try {
-              response = await fetchWithTimeout(readerUrl, {
-                headers: {
-                  accept: "text/plain",
-                  "user-agent": USER_AGENT,
-                  "x-respond-with": "html",
-                  "x-retain-images": "all",
-                  "x-retain-links": "all",
-                  "x-timeout": "15",
-                },
-                redirect: "follow",
-              }, 22000);
-            } catch (error) {
-              const wrapped = new Error(`Reader proxy ${search.label} failed: ${error?.message ?? error}`);
-              wrapped.status = 0;
-              wrapped.label = search.label;
-              throw wrapped;
-            }
-
-            const body = await response.text();
-            if (!response.ok) {
-              const error = new Error(`Reader proxy returned HTTP ${response.status}`);
-              error.status = response.status;
-              error.label = search.label;
-              error.bodyPreview = body.slice(0, 180);
-              throw error;
-            }
-
-            const items = parseRssItems(body);
-            if (items.length === 0) {
-              const error = new Error("Reader proxy returned no parseable RSS items");
-              error.status = response.status;
-              error.label = search.label;
-              error.bodyPreview = body.slice(0, 180);
-              throw error;
-            }
-
-            return { route: "reader-rss", label: search.label, status: response.status, contentType: response.headers.get("content-type"), items };
-          }
-
-          async function requestSearchPageThroughReader(terms) {
-            const targetUrl = buildSearchPageUrl(terms);
-            const readerUrl = jinaUrl(targetUrl);
-            let response;
-            try {
-              response = await fetchWithTimeout(readerUrl, {
-                headers: {
-                  accept: "text/plain",
-                  "user-agent": USER_AGENT,
-                  "x-respond-with": "markdown",
-                  "x-retain-images": "all",
-                  "x-retain-links": "all",
-                  "x-timeout": "18",
-                },
-                redirect: "follow",
-              }, 25000);
-            } catch (error) {
-              const wrapped = new Error(`Reader search-page fallback failed: ${error?.message ?? error}`);
-              wrapped.status = 0;
-              throw wrapped;
-            }
-
-            const body = await response.text();
-            if (!response.ok) {
-              const error = new Error(`Reader search-page fallback returned HTTP ${response.status}`);
-              error.status = response.status;
-              error.bodyPreview = body.slice(0, 180);
-              throw error;
-            }
-
-            const items = parseReaderMarkdown(body);
-            if (items.length === 0) {
-              const error = new Error("Reader search-page fallback returned no parseable artwork");
-              error.status = response.status;
-              error.bodyPreview = body.slice(0, 180);
-              throw error;
-            }
-
-            return { route: "reader-search-page", label: "search-page", status: response.status, contentType: response.headers.get("content-type"), items, targetUrl };
-          }
-
-          function itemIdentity(item) {
-            return `${item.sourceUrl}\n${item.imageUrl}`;
-          }
-
-          function rankArtwork(item, terms) {
-            const haystack = `${item.title} ${item.description} ${item.categories.join(" ")}`.toLowerCase();
-            let score = Math.random() * 2;
-            for (const term of terms) {
-              const normalized = term.toLowerCase();
-              if (item.title.toLowerCase().includes(normalized)) score += 8;
-              if (haystack.includes(normalized)) score += 3;
-            }
-            return score;
-          }
-
-          async function collectFrom(searches, requester, errors) {
-            const settled = await Promise.allSettled(searches.map(requester));
-            const collected = new Map();
-            const routes = [];
-            for (const result of settled) {
-              if (result.status === "fulfilled") {
-                routes.push(result.value.route);
-                for (const item of result.value.items) collected.set(itemIdentity(item), item);
-              } else {
-                errors.push(result.reason);
-              }
-            }
-            return { items: [...collected.values()], routes };
-          }
-
-          async function findArtwork(terms) {
-            const searches = rssSearches(terms);
-            const errors = [];
-
-            const direct = await collectFrom(searches, requestDirectRss, errors);
-            let usable = direct.items;
-            let route = direct.routes[0] ?? null;
-
-            if (usable.length === 0) {
-              const proxied = await collectFrom(searches, requestRssThroughReader, errors);
-              usable = proxied.items;
-              route = proxied.routes[0] ?? route;
-            }
-
-            if (usable.length === 0) {
-              try {
-                const page = await requestSearchPageThroughReader(terms);
-                usable = page.items;
-                route = page.route;
-              } catch (error) {
-                errors.push(error);
-              }
-            }
-
-            if (usable.length === 0) {
-              const error = errors.at(-1) ?? new Error("All DeviantArt retrieval routes failed");
-              error.allErrors = errors.map((entry) => cleanText(entry?.message ?? entry, 180));
-              throw error;
-            }
-
-            usable.sort((a, b) => rankArtwork(b, terms) - rankArtwork(a, terms));
-            const pool = usable.slice(0, Math.min(12, usable.length));
-            return { item: pool[Math.floor(Math.random() * pool.length)], route };
-          }
-
-          function buildArtworkMessage(item, terms, route) {
-            const searchText = terms.join(" ");
-            const encodedTerms = encodeURIComponent(searchText).slice(0, 78);
-            const fields = [
-              { name: "Artist", value: item.creator, inline: true },
-              { name: "Credit & source", value: `[Open on DeviantArt](${item.sourceUrl})`, inline: false },
-            ];
-            if (item.published) fields.splice(1, 0, { name: "Published", value: cleanText(item.published, 100), inline: true });
-
+          
             return {
+              content: "",
               embeds: [{
-                title: item.title || "DeviantArt artwork",
-                url: item.sourceUrl,
-                description: `Search: \`${cleanText(searchText, 80)}\``,
+                title,
+                url: postUrl,
                 fields,
-                image: { url: item.imageUrl },
-                footer: { text: `DeviantArt result • ${route ?? "reader fallback"} • best-effort mature filtering` },
+                image: { url: imageUrl },
+                footer: {
+                  text: mode === "nsfw"
+                    ? "Age-restricted result from e621 • Underage-tag filters enforced"
+                    : "Safe-rated result from e926",
+                },
               }],
               components: [{
                 type: 1,
                 components: [
-                  { type: 2, style: 1, custom_id: `another:${encodedTerms}`, label: "Another result", emoji: { name: "🔄" } },
-                  { type: 2, style: 5, url: item.sourceUrl, label: "Open post" },
+                  {
+                    type: 2,
+                    style: 1,
+                    custom_id: encodeButtonData(mode, tags),
+                    label: "Another result",
+                    emoji: { name: "🔄" },
+                  },
+                  {
+                    type: 2,
+                    style: 5,
+                    url: postUrl,
+                    label: "Open post",
+                  },
                 ],
               }],
               allowed_mentions: { parse: [] },
             };
           }
-
-          async function searchAndBuild(terms) {
-            const result = await findArtwork(terms);
-            return buildArtworkMessage(result.item, terms, result.route);
-          }
-
-          async function editOriginalInteraction(interaction, data) {
-            const applicationId = interaction?.application_id;
-            const token = interaction?.token;
-            if (!applicationId || !token) throw new Error("Discord interaction is missing application_id or token");
-            const endpoint = `https://discord.com/api/v10/webhooks/${applicationId}/${token}/messages/@original`;
-            const response = await fetch(endpoint, {
-              method: "PATCH",
-              headers: { "content-type": "application/json" },
-              body: JSON.stringify(data),
-            });
-            if (!response.ok) {
-              const body = await response.text();
-              throw new Error(`Discord follow-up edit failed (${response.status}): ${body.slice(0, 300)}`);
-            }
-          }
-
-          async function processSearch(interaction, terms) {
-            try {
-              const message = await searchAndBuild(terms);
-              await editOriginalInteraction(interaction, message);
-            } catch (error) {
-              console.error("DeviantArt reader search failed", error);
-              const status = Number(error?.status ?? 0);
-              let content = "DeviantArt could not be reached through either the direct feed or the reader fallback. Try again shortly.";
-              if (status === 429) content = "The DeviantArt reader fallback is temporarily rate-limiting requests. Try again in a minute.";
-              await editOriginalInteraction(interaction, { content, embeds: [], components: [], allowed_mentions: { parse: [] } });
-            }
-          }
-
-          function handleCommand(interaction, ctx) {
-            if (interaction?.data?.name !== "furry") return ephemeralMessage("Unknown command.");
-
-            const queryOption = interaction?.data?.options?.find((option) => option.name === "query");
-            const { terms, blocked } = tokenizeQuery(String(queryOption?.value ?? ""));
-            if (blocked) return ephemeralMessage("This app only searches for filtered artwork. Try `blue wolf forest` instead.");
-            if (terms.length === 0) return ephemeralMessage("Give me useful search words, such as `cute fox`, `dragon armor`, or `blue wolf forest`.");
-
-            ctx.waitUntil(processSearch(interaction, terms));
-            return json({ type: RESPONSE.DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE });
-          }
-
-          function handleComponent(interaction, ctx) {
-            const customId = String(interaction?.data?.custom_id ?? "");
-            if (!customId.startsWith("another:")) return ephemeralMessage("Unknown button.");
-
+          
+          export function decodeButtonData(customId) {
+            const match = /^another:([sn]):(.{1,80})$/.exec(String(customId ?? ""));
+            if (!match) return null;
+          
             let decoded = "";
-            try { decoded = decodeURIComponent(customId.slice("another:".length)); } catch {}
-            const terms = decoded.split(/\s+/).filter(Boolean).slice(0, 6);
-            if (terms.length === 0) return ephemeralMessage("The saved search was invalid. Run `/furry` again.");
-
-            ctx.waitUntil(processSearch(interaction, terms));
-            return json({ type: RESPONSE.DEFERRED_UPDATE_MESSAGE });
-          }
-
-          async function runDiagnostics(request) {
-            const url = new URL(request.url);
-            const requested = cleanText(url.searchParams.get("q") ?? "blue wolf", 80);
-            const { terms } = tokenizeQuery(requested);
-            const safeTerms = terms.length > 0 ? terms : ["blue", "wolf"];
-            const searches = rssSearches(safeTerms);
-            const report = {
-              ok: false,
-              generated_at: new Date().toISOString(),
-              source: "DeviantArt with direct RSS and Jina Reader fallback",
-              query: safeTerms.join(" "),
-              tests: [],
-            };
-
-            for (const search of searches) {
-              for (const [route, requester] of [["direct-rss", requestDirectRss], ["reader-rss", requestRssThroughReader]]) {
-                try {
-                  const result = await requester(search);
-                  report.tests.push({ name: `${search.label}:${route}`, ok: true, status: result.status, content_type: result.contentType, parsed_items: result.items.length, sample_titles: result.items.slice(0, 3).map((item) => item.title), target_url: search.url.toString() });
-                } catch (error) {
-                  report.tests.push({ name: `${search.label}:${route}`, ok: false, status: Number(error?.status ?? 0), error: cleanText(error?.message ?? error, 200), body_preview: cleanText(error?.bodyPreview ?? "", 180) || undefined, target_url: search.url.toString() });
-                }
-              }
-            }
-
             try {
-              const page = await requestSearchPageThroughReader(safeTerms);
-              report.tests.push({ name: "search-page:reader", ok: true, status: page.status, content_type: page.contentType, parsed_items: page.items.length, sample_titles: page.items.slice(0, 3).map((item) => item.title), target_url: page.targetUrl.toString() });
-            } catch (error) {
-              report.tests.push({ name: "search-page:reader", ok: false, status: Number(error?.status ?? 0), error: cleanText(error?.message ?? error, 200), body_preview: cleanText(error?.bodyPreview ?? "", 180) || undefined, target_url: buildSearchPageUrl(safeTerms).toString() });
+              decoded = decodeURIComponent(match[2]);
+            } catch {
+              return null;
             }
-
-            report.ok = report.tests.some((test) => test.ok && test.parsed_items > 0);
-            return report;
+          
+            const parsed = parseQuery(decoded);
+            if (parsed.blocked || parsed.tags.length === 0) return null;
+            return { mode: match[1] === "n" ? "nsfw" : "safe", tags: parsed.tags };
           }
-
-          export class DeviantArtTokenVault {
-            constructor(state, env) { this.state = state; this.env = env; }
-            async fetch() { return json({ ok: true, unused: true, source: "DeviantArt reader-fallback build" }); }
-          }
-
-          export default {
-            async fetch(request, env, ctx) {
-              const requestUrl = new URL(request.url);
-
-              if (request.method === "GET" && requestUrl.pathname === "/debug/deviantart") return json(await runDiagnostics(request));
-              if (request.method === "GET" && requestUrl.pathname === "/debug/rss") return json(await runDiagnostics(request));
-              if (request.method === "GET") {
-                return new Response(
-                  "Furry Art Finder is online and using DeviantArt through a reader fallback. Open /debug/deviantart?q=blue%20wolf to test it.",
-                  { headers: { "content-type": "text/plain; charset=UTF-8" } },
-                );
+          
+          export async function diagnostics(query = "blue wolf") {
+            const parsed = parseQuery(query);
+            const tests = [];
+          
+            for (const mode of ["safe", "nsfw"]) {
+              const endpoint = mode === "safe" ? SAFE_API : NSFW_API;
+              const url = new URL(endpoint);
+              url.searchParams.set(
+                "tags",
+                [
+                  ...(parsed.tags.length ? parsed.tags : ["wolf"]),
+                  mode === "safe" ? "rating:safe" : "-rating:safe",
+                  ...UNDERAGE_NEGATIVE_TAGS,
+                ].join(" "),
+              );
+              url.searchParams.set("limit", "5");
+          
+              try {
+                const payload = await fetchJson(url);
+                const posts = Array.isArray(payload?.posts) ? payload.posts : [];
+                const usableCount = posts.filter((post) => postIsUsable(post, mode)).length;
+                tests.push({
+                  mode,
+                  ok: true,
+                  status: 200,
+                  returned_posts: posts.length,
+                  usable_posts: usableCount,
+                  endpoint: new URL(endpoint).hostname,
+                });
+              } catch (error) {
+                tests.push({
+                  mode,
+                  ok: false,
+                  status: Number(error?.status ?? 0),
+                  error: error instanceof Error ? error.message : String(error),
+                  body_preview: cleanText(error?.bodyPreview ?? "", 250),
+                  endpoint: new URL(endpoint).hostname,
+                });
               }
-
-              if (request.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
-              if (!env.DISCORD_PUBLIC_KEY) return new Response("Server is not configured", { status: 500 });
-
-              const signature = request.headers.get("x-signature-ed25519");
-              const timestamp = request.headers.get("x-signature-timestamp");
-              const rawBody = await request.text();
-              if (!signature || !timestamp) return new Response("Missing Discord signature", { status: 401 });
-
-              const valid = await verifyKey(rawBody, signature, timestamp, env.DISCORD_PUBLIC_KEY);
-              if (!valid) return new Response("Invalid request signature", { status: 401 });
-
-              let interaction;
-              try { interaction = JSON.parse(rawBody); } catch { return new Response("Invalid JSON", { status: 400 }); }
-
-              if (interaction.type === INTERACTION.PING) return json({ type: RESPONSE.PONG });
-              if (interaction.type === INTERACTION.APPLICATION_COMMAND) return handleCommand(interaction, ctx);
-              if (interaction.type === INTERACTION.MESSAGE_COMPONENT) return handleComponent(interaction, ctx);
-              return ephemeralMessage("Unsupported Discord interaction.");
-            },
-          };
-          WORKER_EOF
-
-          cat > scripts/register-commands.js <<'REGISTER_EOF'
+            }
+          
+            return {
+              ok: tests.every((test) => test.ok),
+              generated_at: new Date().toISOString(),
+              query: parsed.display || "wolf",
+              tests,
+            };
+          }
+          
+          export { cleanText };
+          __LIB_E6_JS_EOF__
+          cat > scripts/configure-discord.js <<'__SCRIPTS_CONFIGURE_DISCORD_JS_EOF__'
           const applicationId = process.env.DISCORD_APPLICATION_ID;
           const botToken = process.env.DISCORD_BOT_TOKEN;
-          const legacyGuildId = process.env.DISCORD_GUILD_ID?.trim();
+          const interactionsEndpointUrl = process.env.INTERACTIONS_ENDPOINT_URL;
           
-          if (!applicationId || !botToken) {
+          if (!applicationId || !botToken || !interactionsEndpointUrl) {
             console.error(
-              "Missing DISCORD_APPLICATION_ID or DISCORD_BOT_TOKEN. Add them as GitHub Actions secrets.",
+              "Missing DISCORD_APPLICATION_ID, DISCORD_BOT_TOKEN, or INTERACTIONS_ENDPOINT_URL.",
             );
             process.exit(1);
           }
+          
+          const queryOption = {
+            type: 3,
+            name: "query",
+            description: "Tags such as blue wolf, fox forest, or dragon armor",
+            required: true,
+            min_length: 2,
+            max_length: 55,
+          };
           
           const commands = [
             {
               name: "furry",
               type: 1,
-              description: "Find filtered furry artwork from DeviantArt",
+              description: "Find safe furry artwork",
               nsfw: false,
               integration_types: [1],
               contexts: [0, 1, 2],
-              options: [
-                {
-                  type: 3,
-                  name: "query",
-                  description: "Example: blue wolf forest, cute fox, or dragon armor",
-                  required: true,
-                  min_length: 2,
-                  max_length: 80,
-                },
-              ],
+              options: [queryOption],
+            },
+            {
+              name: "furry-nsfw",
+              type: 1,
+              description: "Find age-restricted furry artwork (18+)",
+              nsfw: true,
+              integration_types: [1],
+              contexts: [0, 1, 2],
+              options: [queryOption],
             },
           ];
           
-          async function putCommands(endpoint, commandList) {
-            const response = await fetch(endpoint, {
-              method: "PUT",
+          async function discordRequest(path, options) {
+            const response = await fetch(`https://discord.com/api/v10${path}`, {
+              ...options,
               headers: {
                 Authorization: `Bot ${botToken}`,
-                "Content-Type": "application/json",
+                "content-type": "application/json",
+                ...(options?.headers ?? {}),
               },
-              body: JSON.stringify(commandList),
             });
           
             const body = await response.text();
             if (!response.ok) {
-              throw new Error(`Discord command registration failed (${response.status}): ${body}`);
+              throw new Error(`Discord API ${path} failed (${response.status}): ${body}`);
             }
+            return body ? JSON.parse(body) : null;
           }
           
           try {
-            await putCommands(
-              `https://discord.com/api/v10/applications/${applicationId}/commands`,
-              commands,
-            );
-            console.log("Registered /furry globally for User Install with DeviantArt reader fallback.");
+            await discordRequest("/applications/@me", {
+              method: "PATCH",
+              body: JSON.stringify({
+                interactions_endpoint_url: interactionsEndpointUrl,
+              }),
+            });
+            console.log("Updated Discord Interactions Endpoint URL.");
           
-            if (legacyGuildId) {
-              await putCommands(
-                `https://discord.com/api/v10/applications/${applicationId}/guilds/${legacyGuildId}/commands`,
-                [],
-              );
-              console.log(`Removed legacy guild commands from ${legacyGuildId}.`);
-            }
+            await discordRequest(`/applications/${applicationId}/commands`, {
+              method: "PUT",
+              body: JSON.stringify(commands),
+            });
+            console.log("Registered /furry and /furry-nsfw globally for User Install.");
           } catch (error) {
             console.error(error instanceof Error ? error.message : error);
             process.exit(1);
           }
-          REGISTER_EOF
+          __SCRIPTS_CONFIGURE_DISCORD_JS_EOF__
+          cat > README.md <<'__README_MD_EOF__'
+          # Shift's Furry Search — safe + NSFW commands
+          
+          A Discord **user-installed** app with two commands:
+          
+          - `/furry query:...` uses **e926** and only accepts safe-rated results.
+          - `/furry-nsfw query:...` uses **e621**, is registered with Discord's `nsfw: true` field, and only accepts questionable/explicit results.
+          
+          Both commands reject underage-related search terms and returned posts tagged with common underage indicators.
+          
+          ## Why two commands instead of one toggle?
+          
+          Discord marks age restriction on the whole command. Keeping a separate `/furry-nsfw` command lets `/furry` remain visible as a normal safe command while Discord applies its 18+ restrictions to the other command.
+          
+          ## Required GitHub Actions secrets
+          
+          - `DISCORD_APPLICATION_ID`
+          - `DISCORD_PUBLIC_KEY`
+          - `DISCORD_BOT_TOKEN`
+          - `VERCEL_TOKEN`
+          
+          The deployment tests both e926 and e621 from Vercel **before** it changes your Discord Interactions Endpoint URL.
+          
+          ## Deploy
+          
+          1. Put this project in your GitHub repository.
+          2. Add the four Actions secrets above.
+          3. Open **Actions → Deploy Shift Furry Bot → Run workflow**.
+          4. The workflow deploys to Vercel, opens `/health`, and only then updates Discord.
+          5. Test `/furry query:blue wolf` and `/furry-nsfw query:blue wolf`.
+          
+          ## Content controls
+          
+          The filtering is defense-in-depth, not a claim of perfect classification:
+          
+          - fixed ratings controlled by the application;
+          - user attempts to use `rating:`, `order:`, and similar meta tags are rejected;
+          - underage-related query terms are rejected;
+          - negative underage tags are added to every API search;
+          - returned posts are checked again before display;
+          - unsupported video formats are skipped.
+          
+          ## Attribution
+          
+          This project uses an original implementation of the multi-source/source-adapter idea used by
+          [FurExplicitBot](https://github.com/FlippedCodes/furexplicitbot), an MIT-licensed Discord bot.
+          No FurExplicitBot source file is copied verbatim in this build.
+          __README_MD_EOF__
+          cat > LICENSE <<'__LICENSE_EOF__'
+          MIT License
+          
+          Copyright (c) 2026 Shift's Furry Search contributors
+          
+          Permission is hereby granted, free of charge, to any person obtaining a copy
+          of this software and associated documentation files (the "Software"), to deal
+          in the Software without restriction, including without limitation the rights
+          to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+          copies of the Software, and to permit persons to whom the Software is
+          furnished to do so, subject to the following conditions:
+          
+          The above copyright notice and this permission notice shall be included in all
+          copies or substantial portions of the Software.
+          
+          THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+          IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+          FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+          AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+          LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+          OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+          SOFTWARE.
+          __LICENSE_EOF__
+          cat > THIRD_PARTY_NOTICES.txt <<'__THIRD_PARTY_NOTICES_TXT_EOF__'
+          Third-party inspiration and dependencies
+          
+          FurExplicitBot
+          Repository: https://github.com/FlippedCodes/furexplicitbot
+          License identified by GitHub as MIT.
+          This project borrows the high-level idea of source adapters and normalized
+          Discord responses. No FurExplicitBot source file is copied verbatim.
+          
+          Runtime dependencies retain their own licenses:
+          - discord-interactions
+          - @vercel/functions
+          - Vercel CLI (development/deployment only)
+          __THIRD_PARTY_NOTICES_TXT_EOF__
+          cat > .gitignore <<'__GITIGNORE_EOF__'
+          node_modules/
+          .vercel/
+          .env*
+          !.env.example
+          npm-debug.log*
+          __GITIGNORE_EOF__
+          cat > .env.example <<'__ENV_EXAMPLE_EOF__'
+          DISCORD_APPLICATION_ID=
+          DISCORD_PUBLIC_KEY=
+          DISCORD_BOT_TOKEN=
+          INTERACTIONS_ENDPOINT_URL=
+          __ENV_EXAMPLE_EOF__
 
       - name: Install dependencies
         run: npm install --no-audit --no-fund
 
-      - name: Validate JavaScript
-        run: npm run check
-
-      - name: Deploy Cloudflare Worker
-        run: npx wrangler deploy
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-
-      - name: Add Discord public key to Worker
+      - name: Validate JavaScript and JSON
         shell: bash
-        run: printf '%s' "$DISCORD_PUBLIC_KEY" | npx wrangler secret put DISCORD_PUBLIC_KEY
+        run: |
+          npm run check
+          node -e "JSON.parse(require('fs').readFileSync('package.json','utf8')); JSON.parse(require('fs').readFileSync('vercel.json','utf8')); console.log('JSON files valid')"
+
+      - name: Link Vercel project
+        run: npx vercel link --yes --project shift-furry-search-fahir56 --token="$VERCEL_TOKEN"
         env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+
+      - name: Deploy to Vercel
+        id: vercel
+        shell: bash
+        run: |
+          DEPLOY_URL="$(
+            npx vercel deploy --prod --yes --token="$VERCEL_TOKEN" \
+              --env "DISCORD_PUBLIC_KEY=$DISCORD_PUBLIC_KEY"
+          )"
+          echo "Deployment URL: $DEPLOY_URL"
+          echo "deployment_url=$DEPLOY_URL" >> "$GITHUB_OUTPUT"
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
           DISCORD_PUBLIC_KEY: ${{ secrets.DISCORD_PUBLIC_KEY }}
 
-      - name: Register user-installed slash command
-        run: npm run register
+      - name: Verify e926 and e621 from Vercel
+        shell: bash
+        run: |
+          HEALTH_URL="${{ steps.vercel.outputs.deployment_url }}/health?q=blue%20wolf"
+          echo "Testing $HEALTH_URL"
+          curl --fail --show-error --silent --retry 3 --retry-delay 2 "$HEALTH_URL" | tee /tmp/health.json
+          node -e '
+            const report = JSON.parse(require("fs").readFileSync("/tmp/health.json", "utf8"));
+            console.log(JSON.stringify(report, null, 2));
+            if (!report.ok) {
+              console.error("At least one artwork source is blocked from Vercel.");
+              process.exit(1);
+            }
+          '
+
+      - name: Point Discord to Vercel and register commands
+        run: node scripts/configure-discord.js
         env:
           DISCORD_APPLICATION_ID: ${{ secrets.DISCORD_APPLICATION_ID }}
           DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
-          
+          INTERACTIONS_ENDPOINT_URL: ${{ steps.vercel.outputs.deployment_url }}/api/interactions
