@@ -1,4 +1,4 @@
-name: Deploy Furry Art Discord App (DeviantArt Durable OAuth)
+name: Deploy Furry Art Discord App (Openverse)
 
 on:
   workflow_dispatch:
@@ -35,13 +35,12 @@ jobs:
           cat > package.json <<'PACKAGE_EOF'
           {
             "name": "furry-art-discord-user-app",
-            "version": "1.0.0",
+            "version": "3.0.0",
             "private": true,
             "type": "module",
-            "description": "A user-installed Discord app for searching non-mature furry artwork on DeviantArt from DMs, group DMs, and servers.",
+            "description": "A user-installed Discord app for searching non-mature, openly licensed furry artwork through Openverse.",
             "scripts": {
               "check": "node --check src/index.js && node --check scripts/register-commands.js",
-              "dev": "wrangler dev",
               "deploy": "wrangler deploy",
               "register": "node scripts/register-commands.js"
             },
@@ -65,118 +64,43 @@ jobs:
             "compatibility_date": "2026-08-02",
             "compatibility_flags": ["nodejs_compat"],
             "workers_dev": true,
-            "durable_objects": {
-              "bindings": [
-                {
-                  "name": "DEVIANTART_TOKEN_VAULT",
-                  "class_name": "DeviantArtTokenVault"
-                }
-              ]
-            },
-            "exports": {
-              "DeviantArtTokenVault": {
-                "type": "durable-object",
-                "storage": "sqlite"
-              }
-            },
             "observability": {
-              "enabled": true,
-              "logs": {
-                "invocation_logs": true,
-                "head_sampling_rate": 1
-              }
+              "enabled": true
             }
           }
           WRANGLER_EOF
 
           cat > src/index.js <<'WORKER_EOF'
           import { verifyKey } from "discord-interactions";
-          import { DurableObject } from "cloudflare:workers";
-          
+
           const INTERACTION = Object.freeze({
             PING: 1,
             APPLICATION_COMMAND: 2,
             MESSAGE_COMPONENT: 3,
           });
-          
+
           const RESPONSE = Object.freeze({
             PONG: 1,
             CHANNEL_MESSAGE_WITH_SOURCE: 4,
             UPDATE_MESSAGE: 7,
           });
-          
+
           const EPHEMERAL = 1 << 6;
-          const DEVIANTART_AUTHORIZE_URL = "https://www.deviantart.com/oauth2/authorize";
-          const DEVIANTART_TOKEN_URL = "https://www.deviantart.com/oauth2/token";
-          const DEVIANTART_PLACEBO_URL = "https://www.deviantart.com/api/v1/oauth2/placebo";
-          const DEVIANTART_TAG_URL = "https://www.deviantart.com/api/v1/oauth2/browse/tags";
-          const DEVIANTART_SEARCH_ENDPOINTS = [
-            "https://www.deviantart.com/api/v1/oauth2/browse/newest",
-            "https://www.deviantart.com/api/v1/oauth2/browse/popular",
-          ];
+          const OPENVERSE_IMAGES_URL = "https://api.openverse.org/v1/images/";
           const USER_AGENT =
-            "ShiftFurrySearch/3.0 (by Fahir56 on GitHub; non-mature art search)";
-          const WORKER_ORIGIN = "https://furry-art-finder-app.hsa94110.workers.dev";
-          const DEVIANTART_REDIRECT_URI = `${WORKER_ORIGIN}/oauth/callback`;
-          
-          let cachedDeviantArtToken = null;
-          let cachedDeviantArtTokenExpiresAt = 0;
-          let cachedDeviantArtTokenSource = null;
-          let cachedDeviantArtTokenMetadata = null;
-          
+            "ShiftFurrySearch/3.0 (Discord user app; openly licensed artwork search)";
+
           const STOP_WORDS = new Set([
-            "a",
-            "an",
-            "and",
-            "art",
-            "artwork",
-            "drawing",
-            "furry",
-            "for",
-            "from",
-            "in",
-            "of",
-            "on",
-            "picture",
-            "please",
-            "show",
-            "the",
-            "to",
-            "with",
+            "a", "an", "and", "art", "artwork", "drawing", "furry", "for",
+            "from", "in", "of", "on", "picture", "please", "show", "the",
+            "to", "with",
           ]);
-          
+
           const BLOCKED_WORDS = new Set([
-            "adult",
-            "explicit",
-            "fetish",
-            "naked",
-            "nude",
-            "nsfw",
-            "porn",
-            "pornographic",
-            "sex",
-            "sexual",
-            "yiff",
+            "adult", "explicit", "fetish", "naked", "nude", "nsfw", "porn",
+            "pornographic", "sex", "sexual", "yiff",
           ]);
-          
-          const FUR_COLORS = new Set([
-            "black",
-            "blue",
-            "brown",
-            "cyan",
-            "gray",
-            "green",
-            "grey",
-            "orange",
-            "pink",
-            "purple",
-            "red",
-            "tan",
-            "teal",
-            "white",
-            "yellow",
-          ]);
-          
+
           function json(data, status = 200) {
             return new Response(JSON.stringify(data), {
               status,
@@ -186,14 +110,14 @@ jobs:
               },
             });
           }
-          
+
           function ephemeralMessage(content) {
             return json({
               type: RESPONSE.CHANNEL_MESSAGE_WITH_SOURCE,
               data: { content, flags: EPHEMERAL },
             });
           }
-          
+
           function cleanText(value, maxLength) {
             return String(value ?? "")
               .replace(/[\u0000-\u001F\u007F]/g, " ")
@@ -201,888 +125,198 @@ jobs:
               .trim()
               .slice(0, maxLength);
           }
-          
+
           function tokenizeQuery(input) {
-            const raw = cleanText(input, 60).toLowerCase();
-            if (!raw) return { tags: [], blocked: false };
-          
+            const raw = cleanText(input, 80).toLowerCase();
+            if (!raw) return { terms: [], blocked: false };
+
             const pieces = raw.match(/"[^"]+"|'[^']+'|\S+/g) ?? [];
-            const tokens = [];
+            const terms = [];
             let blocked = false;
-          
+
             for (const piece of pieces) {
               const withoutQuotes = piece.replace(/^['"]|['"]$/g, "");
               const normalized = withoutQuotes
                 .normalize("NFKD")
                 .replace(/[^a-z0-9 _-]/g, "")
-                .replace(/[-\s]+/g, "_")
-                .replace(/^_+|_+$/g, "")
-                .slice(0, 30);
-          
+                .replace(/[-_\s]+/g, " ")
+                .trim()
+                .slice(0, 35);
+
               if (!normalized) continue;
-          
-              const words = normalized.split("_");
+              const words = normalized.split(/\s+/);
               if (words.some((word) => BLOCKED_WORDS.has(word))) {
                 blocked = true;
                 continue;
               }
-          
+
               if (STOP_WORDS.has(normalized)) continue;
-              tokens.push(normalized);
+              terms.push(normalized);
             }
-          
-            const unique = [...new Set(tokens)];
-          
-            // DeviantArt accepts a normal text query. Keep enough words to preserve
-            // the user's description while preventing very long search strings.
-            return { tags: unique.slice(0, 5), blocked };
+
+            return { terms: [...new Set(terms)].slice(0, 6), blocked };
           }
-          
-          function normalizeSearchTerms(tags) {
-            return tags
-              .map((tag) => tag.replaceAll("_", " "))
-              .filter(Boolean)
-              .join(" ");
+
+          function isHttpsUrl(value) {
+            return typeof value === "string" && value.startsWith("https://");
           }
-          
-          function imageUrlFor(deviation) {
-            const candidates = [
-              deviation?.content?.src,
-              deviation?.thumbs?.find((thumb) => Number(thumb?.height ?? 0) >= 400)?.src,
-              deviation?.thumbs?.at?.(-1)?.src,
-            ];
-            return candidates.find(
-              (value) => typeof value === "string" && value.startsWith("https://"),
-            );
+
+          function imageUrlFor(item) {
+            const candidates = [item?.thumbnail, item?.url];
+            return candidates.find(isHttpsUrl) ?? null;
           }
-          
-          function isDisplayableArtwork(deviation) {
+
+          function sourceUrlFor(item) {
+            const candidates = [item?.foreign_landing_url, item?.detail_url, item?.url];
+            return candidates.find(isHttpsUrl) ?? null;
+          }
+
+          function isDisplayableArtwork(item) {
+            const filetype = String(item?.filetype ?? "").toLowerCase();
+            const imageTypeOkay = !filetype || ["jpg", "jpeg", "png", "gif", "webp"].includes(filetype);
             return (
-              deviation?.is_mature === false &&
-              deviation?.is_deleted !== true &&
-              Boolean(imageUrlFor(deviation)) &&
-              typeof deviation?.url === "string" &&
-              deviation.url.startsWith("https://")
+              item?.mature !== true &&
+              imageTypeOkay &&
+              Boolean(imageUrlFor(item)) &&
+              Boolean(sourceUrlFor(item))
             );
           }
-          
+
           function sleep(milliseconds) {
             return new Promise((resolve) => setTimeout(resolve, milliseconds));
           }
-          
-          function bytesToBase64Url(bytes) {
-            let binary = "";
-            for (let offset = 0; offset < bytes.length; offset += 0x8000) {
-              binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
-            }
-            return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/g, "");
-          }
-          
-          function textToBase64Url(text) {
-            return bytesToBase64Url(new TextEncoder().encode(text));
-          }
-          
-          function base64UrlToText(value) {
-            const normalized = value.replaceAll("-", "+").replaceAll("_", "/");
-            const padded = normalized + "=".repeat((4 - (normalized.length % 4)) % 4);
-            const binary = atob(padded);
-            const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
-            return new TextDecoder().decode(bytes);
-          }
-          
-          function randomBase64Url(byteLength = 32) {
-            const bytes = new Uint8Array(byteLength);
-            crypto.getRandomValues(bytes);
-            return bytesToBase64Url(bytes);
-          }
-          
-          async function sha256Base64Url(value) {
-            const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
-            return bytesToBase64Url(new Uint8Array(digest));
-          }
-          
-          async function hmacBase64Url(secret, value) {
-            const key = await crypto.subtle.importKey(
-              "raw",
-              new TextEncoder().encode(secret),
-              { name: "HMAC", hash: "SHA-256" },
-              false,
-              ["sign"],
-            );
-            const signature = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(value));
-            return bytesToBase64Url(new Uint8Array(signature));
-          }
-          
-          function constantTimeTextEqual(left, right) {
-            if (left.length !== right.length) return false;
-            let difference = 0;
-            for (let index = 0; index < left.length; index += 1) {
-              difference |= left.charCodeAt(index) ^ right.charCodeAt(index);
-            }
-            return difference === 0;
-          }
-          
-          function parseCookies(request) {
-            const result = {};
-            for (const pair of String(request.headers.get("cookie") ?? "").split(";")) {
-              const separator = pair.indexOf("=");
-              if (separator < 1) continue;
-              const key = pair.slice(0, separator).trim();
-              const value = pair.slice(separator + 1).trim();
-              if (key) result[key] = value;
-            }
-            return result;
-          }
-          
-          async function createSignedOauthCookie(payload, secret) {
-            const encoded = textToBase64Url(JSON.stringify(payload));
-            const signature = await hmacBase64Url(secret, encoded);
-            return `${encoded}.${signature}`;
-          }
-          
-          async function readSignedOauthCookie(value, secret) {
-            const [encoded, signature, extra] = String(value ?? "").split(".");
-            if (!encoded || !signature || extra) return null;
-            const expected = await hmacBase64Url(secret, encoded);
-            if (!constantTimeTextEqual(signature, expected)) return null;
-            try {
-              const payload = JSON.parse(base64UrlToText(encoded));
-              if (Number(payload?.expires_at ?? 0) < Date.now()) return null;
-              return payload;
-            } catch {
-              return null;
-            }
-          }
-          
-          function htmlEscape(value) {
-            return String(value ?? "")
-              .replaceAll("&", "&amp;")
-              .replaceAll("<", "&lt;")
-              .replaceAll(">", "&gt;")
-              .replaceAll('"', "&quot;")
-              .replaceAll("'", "&#39;");
-          }
-          
-          function htmlPage(title, body, status = 200, extraHeaders = {}) {
-            return new Response(
-              `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${htmlEscape(title)}</title><style>body{font-family:system-ui,sans-serif;max-width:760px;margin:36px auto;padding:0 18px;line-height:1.5;background:#111;color:#eee}code,pre{background:#222;border-radius:8px;padding:10px;display:block;overflow-wrap:anywhere;white-space:pre-wrap}a{color:#8ab4ff}.ok{color:#79d279}.bad{color:#ff8c8c}</style></head><body><h1>${htmlEscape(title)}</h1>${body}</body></html>`,
-              {
-                status,
+
+          async function requestOpenverse(query, page) {
+            const url = new URL(OPENVERSE_IMAGES_URL);
+            url.searchParams.set("q", query);
+            url.searchParams.set("page_size", "50");
+            url.searchParams.set("page", String(page));
+
+            for (let attempt = 1; attempt <= 2; attempt += 1) {
+              const response = await fetch(url, {
                 headers: {
-                  "content-type": "text/html; charset=UTF-8",
-                  "cache-control": "no-store, private",
-                  ...extraHeaders,
+                  accept: "application/json",
+                  "accept-encoding": "gzip, br",
+                  "user-agent": USER_AGENT,
                 },
-              },
-            );
-          }
-          
-          function deviantArtBaseHeaders() {
-            return {
-              accept: "application/json",
-              "user-agent": USER_AGENT,
-            };
-          }
-          
-          function isAllowedDeviantArtRedirect(url) {
-            const hostname = new URL(url).hostname.toLowerCase();
-            return hostname === "deviantart.com" || hostname === "www.deviantart.com" || hostname.endsWith(".deviantart.com");
-          }
-          
-          async function fetchDeviantArtWithBearer(url, token, options = {}) {
-            let currentUrl = new URL(url.toString());
-            for (let redirectCount = 0; redirectCount <= 3; redirectCount += 1) {
-              const headers = new Headers(options.headers ?? {});
-              for (const [name, value] of Object.entries(deviantArtBaseHeaders())) {
-                if (!headers.has(name)) headers.set(name, value);
-              }
-              headers.set("Authorization", `Bearer ${token}`);
-          
-              const response = await fetch(currentUrl, {
-                ...options,
-                headers,
-                redirect: "manual",
-              });
-          
-              if (![301, 302, 303, 307, 308].includes(response.status)) return response;
-              const location = response.headers.get("location");
-              if (!location) return response;
-              const nextUrl = new URL(location, currentUrl);
-              console.warn("DeviantArt redirect", currentUrl.toString(), "->", nextUrl.toString());
-              if (nextUrl.protocol !== "https:" || !isAllowedDeviantArtRedirect(nextUrl)) {
-                throw new Error("DeviantArt redirected to an unexpected host");
-              }
-              currentUrl = nextUrl;
-            }
-            throw new Error("Too many DeviantArt redirects");
-          }
-          
-          async function requestOAuthToken(env, grantFields, credentialMode = "body") {
-            if (!env.DEVIANTART_CLIENT_ID || !env.DEVIANTART_CLIENT_SECRET) {
-              throw new Error("DEVIANTART_CLIENT_ID or DEVIANTART_CLIENT_SECRET is not configured");
-            }
-          
-            const form = new URLSearchParams(grantFields);
-            const headers = {
-              ...deviantArtBaseHeaders(),
-              "content-type": "application/x-www-form-urlencoded",
-            };
-          
-            if (credentialMode === "basic") {
-              headers.Authorization = `Basic ${btoa(`${env.DEVIANTART_CLIENT_ID}:${env.DEVIANTART_CLIENT_SECRET}`)}`;
-            } else {
-              form.set("client_id", env.DEVIANTART_CLIENT_ID);
-              form.set("client_secret", env.DEVIANTART_CLIENT_SECRET);
-            }
-          
-            const response = await fetch(DEVIANTART_TOKEN_URL, {
-              method: "POST",
-              headers,
-              body: form.toString(),
-              redirect: "manual",
-            });
-            const body = await response.text();
-          
-            let payload = null;
-            try {
-              payload = JSON.parse(body);
-            } catch {}
-          
-            if (!response.ok || typeof payload?.access_token !== "string") {
-              const error = new Error(
-                `DeviantArt token request failed (${response.status}): ${cleanText(payload?.error ?? body, 160)}`,
-              );
-              error.status = response.status;
-              error.oauthError = payload?.error;
-              throw error;
-            }
-          
-            const accessToken = payload.access_token.trim();
-            if (!accessToken) throw new Error("DeviantArt returned an empty access token");
-            return {
-              accessToken,
-              refreshToken: typeof payload?.refresh_token === "string" ? payload.refresh_token.trim() : null,
-              expiresIn: Math.max(60, Number(payload?.expires_in ?? 3600)),
-              tokenType: String(payload?.token_type ?? "Bearer"),
-              scope: String(payload?.scope ?? ""),
-              status: String(payload?.status ?? ""),
-              credentialMode,
-            };
-          }
-          
-          async function requestOAuthTokenWithFallback(env, grantFields) {
-            let lastError = null;
-            for (const credentialMode of ["basic", "body"]) {
-              try {
-                return await requestOAuthToken(env, grantFields, credentialMode);
-              } catch (error) {
-                lastError = error;
-                console.error("DeviantArt token mode failed", credentialMode, error);
-              }
-            }
-            throw lastError ?? new Error("DeviantArt token request failed");
-          }
-          
-          async function probeDeviantArtToken(token) {
-            const tests = [];
-            for (const [name, url, method] of [
-              ["placebo:durable-token", DEVIANTART_PLACEBO_URL, "GET"],
-              ["tag:furry:durable-token", `${DEVIANTART_TAG_URL}?tag=furry&limit=1&offset=0&mature_content=false&with_session=false`, "GET"],
-            ]) {
-              try {
-                const response = await fetchDeviantArtWithBearer(new URL(url), token, { method });
-                const body = await response.text();
-                tests.push({ name, ok: response.ok, status: response.status, body: body.slice(0, 180) });
-                if (response.ok) return { ok: true, tests };
-              } catch (error) {
-                tests.push({ name, ok: false, error: String(error?.message ?? error) });
-              }
-            }
-            return { ok: false, tests };
-          }
-          
-          function cacheDeviantArtToken(tokenResult, source) {
-            cachedDeviantArtToken = tokenResult.accessToken;
-            cachedDeviantArtTokenExpiresAt =
-              Date.now() + Math.max(60, tokenResult.expiresIn - 120) * 1000;
-            cachedDeviantArtTokenSource = source;
-            cachedDeviantArtTokenMetadata = {
-              source,
-              token_type: tokenResult.tokenType,
-              expires_in: tokenResult.expiresIn,
-              scope: tokenResult.scope,
-              credential_mode: tokenResult.credentialMode,
-              token_length: tokenResult.accessToken.length,
-            };
-            return cachedDeviantArtToken;
-          }
-          
-          export class DeviantArtTokenVault extends DurableObject {
-            constructor(ctx, env) {
-              super(ctx, env);
-              this.ctx = ctx;
-              this.env = env;
-            }
-
-            async fetch(request) {
-              const url = new URL(request.url);
-
-              if (url.pathname === "/status" && request.method === "GET") {
-                const refreshToken = await this.ctx.storage.get("refresh_token");
-                const accessToken = await this.ctx.storage.get("access_token");
-                const expiresAt = Number((await this.ctx.storage.get("access_expires_at")) ?? 0);
-                return json({
-                  ok: true,
-                  refresh_token_present: typeof refreshToken === "string" && refreshToken.length > 0,
-                  access_token_present: typeof accessToken === "string" && accessToken.length > 0,
-                  access_token_valid:
-                    typeof accessToken === "string" &&
-                    accessToken.length > 0 &&
-                    expiresAt > Date.now() + 120000,
-                  access_expires_at: expiresAt || null,
-                });
-              }
-
-              if (url.pathname === "/store" && request.method === "POST") {
-                const payload = await request.json();
-                const refreshToken = String(payload?.refresh_token ?? "").trim();
-                const accessToken = String(payload?.access_token ?? "").trim();
-                const expiresIn = Math.max(60, Number(payload?.expires_in ?? 3600));
-
-                if (!refreshToken || !accessToken) {
-                  return json({ ok: false, error: "Missing token data" }, 400);
-                }
-
-                await this.ctx.storage.put("refresh_token", refreshToken);
-                await this.ctx.storage.put("access_token", accessToken);
-                await this.ctx.storage.put(
-                  "access_expires_at",
-                  Date.now() + Math.max(60, expiresIn - 120) * 1000,
-                );
-                await this.ctx.storage.put("token_type", String(payload?.token_type ?? "Bearer"));
-                await this.ctx.storage.put("scope", String(payload?.scope ?? ""));
-                await this.ctx.storage.put(
-                  "credential_mode",
-                  String(payload?.credential_mode ?? "authorization_code"),
-                );
-
-                return json({ ok: true });
-              }
-
-              if (url.pathname === "/invalidate" && request.method === "POST") {
-                await this.ctx.storage.delete("access_token");
-                await this.ctx.storage.delete("access_expires_at");
-                return json({ ok: true });
-              }
-
-              if (url.pathname === "/access-token" && request.method === "POST") {
-                const forceRefresh = url.searchParams.get("force") === "1";
-                const storedAccessToken = await this.ctx.storage.get("access_token");
-                const storedExpiresAt = Number(
-                  (await this.ctx.storage.get("access_expires_at")) ?? 0,
-                );
-
-                if (
-                  !forceRefresh &&
-                  typeof storedAccessToken === "string" &&
-                  storedAccessToken.length > 0 &&
-                  storedExpiresAt > Date.now() + 120000
-                ) {
-                  return json({
-                    ok: true,
-                    access_token: storedAccessToken,
-                    expires_at: storedExpiresAt,
-                    source: "durable_object_cache",
-                    token_type: String((await this.ctx.storage.get("token_type")) ?? "Bearer"),
-                    scope: String((await this.ctx.storage.get("scope")) ?? ""),
-                    credential_mode: String(
-                      (await this.ctx.storage.get("credential_mode")) ?? "authorization_code",
-                    ),
-                  });
-                }
-
-                const refreshToken = await this.ctx.storage.get("refresh_token");
-                if (typeof refreshToken !== "string" || !refreshToken) {
-                  return json(
-                    {
-                      ok: false,
-                      code: "DA_SETUP_REQUIRED",
-                      error: "No refresh token is stored",
-                    },
-                    409,
-                  );
-                }
-
-                try {
-                  const refreshed = await requestOAuthTokenWithFallback(this.env, {
-                    grant_type: "refresh_token",
-                    refresh_token: refreshToken,
-                  });
-
-                  const nextRefreshToken = refreshed.refreshToken || refreshToken;
-                  const expiresAt =
-                    Date.now() + Math.max(60, refreshed.expiresIn - 120) * 1000;
-
-                  // DeviantArt may rotate refresh tokens. Persist the newest token
-                  // immediately so cold starts and later deployments keep working.
-                  await this.ctx.storage.put("refresh_token", nextRefreshToken);
-                  await this.ctx.storage.put("access_token", refreshed.accessToken);
-                  await this.ctx.storage.put("access_expires_at", expiresAt);
-                  await this.ctx.storage.put("token_type", refreshed.tokenType);
-                  await this.ctx.storage.put("scope", refreshed.scope);
-                  await this.ctx.storage.put("credential_mode", refreshed.credentialMode);
-
-                  return json({
-                    ok: true,
-                    access_token: refreshed.accessToken,
-                    expires_at: expiresAt,
-                    source: "refresh_token",
-                    token_type: refreshed.tokenType,
-                    scope: refreshed.scope,
-                    credential_mode: refreshed.credentialMode,
-                    refresh_token_rotated: nextRefreshToken !== refreshToken,
-                  });
-                } catch (error) {
-                  console.error("Durable token refresh failed", error);
-                  return json(
-                    {
-                      ok: false,
-                      code: "DA_SETUP_REQUIRED",
-                      error: String(error?.message ?? error),
-                    },
-                    401,
-                  );
-                }
-              }
-
-              return new Response("Not Found", { status: 404 });
-            }
-          }
-
-          function tokenVaultStub(env) {
-            const id = env.DEVIANTART_TOKEN_VAULT.idFromName("global");
-            return env.DEVIANTART_TOKEN_VAULT.get(id);
-          }
-
-          async function tokenVaultRequest(env, path, options = {}) {
-            const response = await tokenVaultStub(env).fetch(
-              new Request(`https://token-vault.internal${path}`, options),
-            );
-            const body = await response.text();
-            let payload = null;
-            try {
-              payload = JSON.parse(body);
-            } catch {}
-            return { response, payload, body };
-          }
-
-          function setupRequiredError(details = null) {
-            const error = new Error("DeviantArt needs one-time user authorization");
-            error.code = "DA_SETUP_REQUIRED";
-            error.details = details;
-            return error;
-          }
-          
-          async function getDeviantArtToken(env, forceRefresh = false) {
-            const now = Date.now();
-            if (!forceRefresh && cachedDeviantArtToken && now < cachedDeviantArtTokenExpiresAt) {
-              return cachedDeviantArtToken;
-            }
-
-            cachedDeviantArtToken = null;
-            cachedDeviantArtTokenExpiresAt = 0;
-
-            const { response, payload, body } = await tokenVaultRequest(
-              env,
-              `/access-token${forceRefresh ? "?force=1" : ""}`,
-              { method: "POST" },
-            );
-
-            if (!response.ok || payload?.ok !== true || typeof payload?.access_token !== "string") {
-              console.error("DeviantArt token vault could not provide a token", response.status, body);
-              throw setupRequiredError({
-                refresh_token_failed: response.status === 401,
-                vault_status: response.status,
-              });
-            }
-
-            const expiresIn = Math.max(
-              60,
-              Math.floor((Number(payload.expires_at ?? 0) - Date.now()) / 1000),
-            );
-
-            return cacheDeviantArtToken(
-              {
-                accessToken: payload.access_token,
-                expiresIn,
-                tokenType: String(payload.token_type ?? "Bearer"),
-                scope: String(payload.scope ?? ""),
-                credentialMode: String(payload.credential_mode ?? "durable_object"),
-              },
-              String(payload.source ?? "durable_object"),
-            );
-          }
-
-          async function handleDeviantArtSetup(request, env) {
-            if (!env.DEVIANTART_CLIENT_ID || !env.DEVIANTART_CLIENT_SECRET) {
-              return htmlPage("DeviantArt setup", '<p class="bad">Client ID or Client Secret is missing from the Worker.</p>', 500);
-            }
-          
-            const verifier = randomBase64Url(64);
-            const challenge = await sha256Base64Url(verifier);
-            const state = randomBase64Url(24);
-            const cookieValue = await createSignedOauthCookie(
-              {
-                verifier,
-                state,
-                redirect_uri: DEVIANTART_REDIRECT_URI,
-                expires_at: Date.now() + 10 * 60 * 1000,
-              },
-              env.DEVIANTART_CLIENT_SECRET,
-            );
-          
-            const authorizeUrl = new URL(DEVIANTART_AUTHORIZE_URL);
-            authorizeUrl.searchParams.set("response_type", "code");
-            authorizeUrl.searchParams.set("client_id", env.DEVIANTART_CLIENT_ID);
-            authorizeUrl.searchParams.set("redirect_uri", DEVIANTART_REDIRECT_URI);
-            authorizeUrl.searchParams.set("scope", "basic browse");
-            authorizeUrl.searchParams.set("state", state);
-            authorizeUrl.searchParams.set("code_challenge", challenge);
-            authorizeUrl.searchParams.set("code_challenge_method", "S256");
-          
-            return new Response(null, {
-              status: 302,
-              headers: {
-                location: authorizeUrl.toString(),
-                "set-cookie": `da_oauth=${cookieValue}; Max-Age=600; Path=/; HttpOnly; Secure; SameSite=Lax`,
-                "cache-control": "no-store",
-              },
-            });
-          }
-          
-          async function handleDeviantArtCallback(request, env) {
-            const url = new URL(request.url);
-            const oauthError = url.searchParams.get("error");
-            if (oauthError) {
-              return htmlPage(
-                "DeviantArt authorization failed",
-                `<p class="bad">${htmlEscape(oauthError)}: ${htmlEscape(url.searchParams.get("error_description") ?? "No description")}</p>`,
-                400,
-              );
-            }
-          
-            const code = url.searchParams.get("code");
-            const state = url.searchParams.get("state");
-            const cookie = parseCookies(request).da_oauth;
-            const saved = await readSignedOauthCookie(cookie, env.DEVIANTART_CLIENT_SECRET);
-            if (!code || !state || !saved || !constantTimeTextEqual(state, String(saved.state ?? ""))) {
-              return htmlPage(
-                "DeviantArt authorization failed",
-                '<p class="bad">The setup session is missing, expired, or invalid. Open <a href="/setup/deviantart">the setup page</a> and try again.</p>',
-                400,
-              );
-            }
-          
-            try {
-              const tokenResult = await requestOAuthTokenWithFallback(env, {
-                grant_type: "authorization_code",
-                code,
-                redirect_uri: saved.redirect_uri,
-                code_verifier: saved.verifier,
-              });
-              const probe = await probeDeviantArtToken(tokenResult.accessToken);
-              const clearCookie = "da_oauth=; Max-Age=0; Path=/; HttpOnly; Secure; SameSite=Lax";
-          
-              if (!tokenResult.refreshToken) {
-                return htmlPage(
-                  "DeviantArt authorized, but no refresh token was returned",
-                  `<p class="bad">Authorization completed, but DeviantArt did not issue a refresh token. Probe result:</p><pre>${htmlEscape(JSON.stringify(probe, null, 2))}</pre>`,
-                  500,
-                  { "set-cookie": clearCookie },
-                );
-              }
-          
-              const stored = await tokenVaultRequest(env, "/store", {
-                method: "POST",
-                headers: { "content-type": "application/json" },
-                body: JSON.stringify({
-                  refresh_token: tokenResult.refreshToken,
-                  access_token: tokenResult.accessToken,
-                  expires_in: tokenResult.expiresIn,
-                  token_type: tokenResult.tokenType,
-                  scope: tokenResult.scope,
-                  credential_mode: tokenResult.credentialMode,
-                }),
               });
 
-              if (!stored.response.ok || stored.payload?.ok !== true) {
-                throw new Error("Cloudflare could not store the DeviantArt token securely");
-              }
-
-              cacheDeviantArtToken(tokenResult, "authorization_code");
-
-              return htmlPage(
-                "DeviantArt authorization complete",
-                `<p class="ok">Authorization is saved securely in Cloudflare.</p><p>The user access token works: ${probe.ok ? "yes" : "not confirmed"}.</p><p>You do not need to copy a refresh token or rerun GitHub Actions.</p><p>Open <a href="/debug/deviantart">/debug/deviantart</a> to test the API, then try the Discord command.</p>`,
-                200,
-                { "set-cookie": clearCookie },
-              );
-            } catch (error) {
-              console.error("DeviantArt authorization-code exchange failed", error);
-              return htmlPage(
-                "DeviantArt authorization failed",
-                `<p class="bad">${htmlEscape(error?.message ?? error)}</p><p>Open <a href="/setup/deviantart">the setup page</a> and try again.</p>`,
-                500,
-                { "set-cookie": "da_oauth=; Max-Age=0; Path=/; HttpOnly; Secure; SameSite=Lax" },
-              );
-            }
-          }
-          
-          async function requestDeviantArtJson(url, token, label, maxAttempts = 3) {
-            for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-              console.log("DeviantArt request", label, `attempt=${attempt}`, url.toString());
-              const response = await fetchDeviantArtWithBearer(url, token, { method: "GET" });
               const body = await response.text();
-          
-              console.log(
-                "DeviantArt response",
-                label,
-                `attempt=${attempt}`,
-                `status=${response.status}`,
-                response.headers.get("content-type") ?? "unknown",
-              );
-          
               if (response.ok) {
                 try {
                   return JSON.parse(body);
                 } catch {
-                  console.error("DeviantArt returned non-JSON", label, body.slice(0, 300));
-                  throw new Error("Artwork source returned invalid JSON");
+                  console.error(
+                    "Openverse returned non-JSON",
+                    response.headers.get("content-type"),
+                    body.slice(0, 300),
+                  );
+                  throw new Error("Openverse returned invalid JSON");
                 }
               }
-          
+
               console.error(
-                "DeviantArt request failed",
-                label,
+                "Openverse search attempt failed",
                 `attempt=${attempt}`,
                 `status=${response.status}`,
+                response.headers.get("content-type"),
                 body.slice(0, 300),
               );
-          
-              if (response.status === 401 && cachedDeviantArtTokenSource === "refresh_token") {
-                cachedDeviantArtToken = null;
-                cachedDeviantArtTokenExpiresAt = 0;
-              }
-          
+
               const retryable = [429, 500, 502, 503, 504].includes(response.status);
-              if (!retryable || attempt === maxAttempts) {
-                const error = new Error(`Artwork source returned HTTP ${response.status}`);
+              if (!retryable || attempt === 2) {
+                const error = new Error(`Openverse returned HTTP ${response.status}`);
                 error.status = response.status;
-                error.label = label;
                 throw error;
               }
-          
-              await sleep(350 * 2 ** (attempt - 1));
+
+              await sleep(200 * attempt);
             }
-          
-            throw new Error("DeviantArt request failed without a response");
+
+            throw new Error("Openverse search failed without a response");
           }
-          
-          async function requestDeviantArtTag(tag, token) {
-            const url = new URL(DEVIANTART_TAG_URL);
-            url.searchParams.set("tag", tag);
-            url.searchParams.set("limit", "50");
-            url.searchParams.set("offset", "0");
-            url.searchParams.set("mature_content", "false");
-            url.searchParams.set("with_session", "false");
-            return requestDeviantArtJson(url, token, `tag:${tag}`, 2);
-          }
-          
-          async function requestDeviantArtSearch(endpoint, token, query) {
-            const url = new URL(endpoint);
-            url.searchParams.set("q", query);
-            url.searchParams.set("limit", "40");
-            url.searchParams.set("offset", "0");
-            url.searchParams.set("mature_content", "false");
-            url.searchParams.set("with_session", "false");
-          
-            if (endpoint.endsWith("/popular")) {
-              url.searchParams.set("timerange", "alltime");
-            }
-          
-            return requestDeviantArtJson(url, token, endpoint.split("/").at(-1), 3);
-          }
-          
-          function rankArtwork(deviation, tags) {
-            const haystack = cleanText(
-              `${deviation?.title ?? ""} ${deviation?.author?.username ?? ""}`,
-              500,
-            ).toLowerCase();
-            let score = 0;
-            for (const tag of tags) {
-              const term = tag.replaceAll("_", " ").toLowerCase();
-              if (term && haystack.includes(term)) score += 3;
-            }
-            score += Math.min(5, Number(deviation?.stats?.favourites ?? 0) / 1000);
-            return score + Math.random();
-          }
-          
-          async function findArtwork(tags, env) {
-            const token = await getDeviantArtToken(env);
-            const terms = normalizeSearchTerms(tags);
-            const query = `furry ${terms}`.trim();
-            const collected = new Map();
+
+          async function findArtwork(terms) {
+            const text = terms.join(" ");
+            const queries = [
+              `furry ${text}`.trim(),
+              `anthropomorphic animal ${text}`.trim(),
+            ];
+
             let lastError = null;
-          
-            // Tag browsing is a separate DeviantArt endpoint and is often more stable
-            // than text search. Try useful query tags first, then furry/anthro.
-            const tagCandidates = [
-              ...tags.filter((tag) => !FUR_COLORS.has(tag)),
-              ...tags.filter((tag) => FUR_COLORS.has(tag)),
-              "furry",
-              "anthro",
-            ]
-              .map((tag) => tag.replace(/[^a-z0-9_]/gi, "").slice(0, 30))
-              .filter(Boolean);
-          
-            for (const tag of [...new Set(tagCandidates)].slice(0, 4)) {
+            for (const query of queries) {
               try {
-                const payload = await requestDeviantArtTag(tag, token);
-                const results = Array.isArray(payload?.results) ? payload.results : [];
-                for (const deviation of results.filter(isDisplayableArtwork)) {
-                  const id = String(deviation?.deviationid ?? deviation?.url ?? "");
-                  if (id) collected.set(id, deviation);
+                const requestedPage = 1 + Math.floor(Math.random() * 3);
+                let payload = await requestOpenverse(query, requestedPage);
+                let results = Array.isArray(payload?.results) ? payload.results : [];
+                let usable = results.filter(isDisplayableArtwork);
+
+                // A less common query may not have enough pages. Retry page 1 before
+                // moving to the alternate wording.
+                if (usable.length === 0 && requestedPage !== 1) {
+                  payload = await requestOpenverse(query, 1);
+                  results = Array.isArray(payload?.results) ? payload.results : [];
+                  usable = results.filter(isDisplayableArtwork);
                 }
-                if (collected.size >= 20) break;
-              } catch (error) {
-                lastError = error;
-                console.error("DeviantArt tag endpoint failed; continuing", tag, error);
-              }
-            }
-          
-            if (collected.size > 0) {
-              return [...collected.values()]
-                .sort((a, b) => rankArtwork(b, tags) - rankArtwork(a, tags))[0];
-            }
-          
-            // Fall back to normal DeviantArt text-search endpoints.
-            for (const endpoint of DEVIANTART_SEARCH_ENDPOINTS) {
-              try {
-                const payload = await requestDeviantArtSearch(endpoint, token, query);
-                const results = Array.isArray(payload?.results) ? payload.results : [];
-                const usable = results.filter(isDisplayableArtwork);
+
                 if (usable.length > 0) {
-                  return usable.sort((a, b) => rankArtwork(b, tags) - rankArtwork(a, tags))[0];
+                  return usable[Math.floor(Math.random() * usable.length)];
                 }
-                console.warn("DeviantArt endpoint returned no usable images", endpoint, query);
+
+                console.warn("Openverse query returned no usable images", query);
               } catch (error) {
                 lastError = error;
-                console.error("DeviantArt endpoint failed; trying fallback", endpoint, error);
+                console.error("Openverse query failed; trying alternate wording", query, error);
               }
             }
-          
+
             if (lastError) throw lastError;
             return null;
           }
-          
-          async function runDeviantArtDiagnostics(env) {
-            const vaultStatus = await tokenVaultRequest(env, "/status", { method: "GET" });
-            const report = {
-              ok: false,
-              generated_at: new Date().toISOString(),
-              oauth_mode: "OAuth 2.1 with automatic rotated-token storage",
-              credentials_present: {
-                client_id: Boolean(env.DEVIANTART_CLIENT_ID),
-                client_secret: Boolean(env.DEVIANTART_CLIENT_SECRET),
-                refresh_token: vaultStatus.payload?.refresh_token_present === true,
-              },
-              token_vault: vaultStatus.payload ?? null,
-              setup_url: `${WORKER_ORIGIN}/setup/deviantart`,
-              token: null,
-              tests: [],
-            };
 
-            let token;
-            try {
-              // Diagnostics must not force a refresh. The vault refreshes only near expiry.
-              token = await getDeviantArtToken(env, false);
-              report.token = cachedDeviantArtTokenMetadata;
-            } catch (error) {
-              report.error = String(error?.message ?? error);
-              report.error_code = error?.code ?? null;
-              report.details = error?.details ?? null;
-              return report;
-            }
-          
-            const tests = [
-              ["placebo:durable-token", new URL(DEVIANTART_PLACEBO_URL)],
-              [
-                "tag:furry:durable-token",
-                new URL(`${DEVIANTART_TAG_URL}?tag=furry&limit=5&offset=0&mature_content=false&with_session=false`),
-              ],
-              [
-                "newest:furry:durable-token",
-                new URL(`${DEVIANTART_SEARCH_ENDPOINTS[0]}?q=furry&limit=5&offset=0&mature_content=false&with_session=false`),
-              ],
-            ];
-          
-            for (const [name, url] of tests) {
-              try {
-                const response = await fetchDeviantArtWithBearer(url, token, { method: "GET" });
-                const body = await response.text();
-                let resultCount = null;
-                try {
-                  const parsed = JSON.parse(body);
-                  resultCount = Array.isArray(parsed?.results) ? parsed.results.length : null;
-                } catch {}
-                report.tests.push({
-                  name,
-                  ok: response.ok,
-                  status: response.status,
-                  content_type: response.headers.get("content-type"),
-                  result_count: resultCount,
-                  body_preview: response.ok ? undefined : body.slice(0, 180),
-                });
-              } catch (error) {
-                report.tests.push({ name, ok: false, error: String(error?.message ?? error) });
-              }
-            }
-          
-            report.ok = report.tests.some(
-              (test) => ["tag:furry:durable-token", "newest:furry:durable-token"].includes(test.name) && test.ok,
-            );
-            return report;
-          }
-          
-          function buildArtworkMessage(deviation, tags) {
-            const artistText = cleanText(deviation?.author?.username ?? "Unknown", 100);
-            const postUrl = deviation.url;
-            const imageUrl = imageUrlFor(deviation);
-            const title = cleanText(deviation?.title ?? "Furry artwork", 200);
-            const matchedTerms = normalizeSearchTerms(tags);
-            const encodedTags = encodeURIComponent(tags.join(" ")).slice(0, 78);
-          
+          function buildArtworkMessage(item, terms) {
+            const title = cleanText(item?.title ?? "Furry artwork", 200) || "Furry artwork";
+            const creator = cleanText(item?.creator ?? "Unknown creator", 100) || "Unknown creator";
+            const sourceUrl = sourceUrlFor(item);
+            const imageUrl = imageUrlFor(item);
+            const licenseName = cleanText(
+              [item?.license, item?.license_version].filter(Boolean).join(" ").toUpperCase(),
+              80,
+            ) || "Open license";
+            const licenseUrl = isHttpsUrl(item?.license_url) ? item.license_url : null;
+            const searchText = terms.join(" ");
+            const encodedTerms = encodeURIComponent(searchText).slice(0, 78);
+
+            const licenseValue = licenseUrl
+              ? `[${licenseName}](${licenseUrl})`
+              : licenseName;
+
             return {
               embeds: [
                 {
-                  title: title || "Non-mature furry artwork",
-                  url: postUrl,
-                  description: `Search: \`${cleanText(matchedTerms, 80)}\``,
+                  title,
+                  url: sourceUrl,
+                  description: `Search: \`${cleanText(searchText, 80)}\``,
                   fields: [
                     {
-                      name: "Artist",
-                      value: artistText || "Unknown",
+                      name: "Creator",
+                      value: creator,
+                      inline: true,
+                    },
+                    {
+                      name: "License",
+                      value: licenseValue,
                       inline: true,
                     },
                     {
                       name: "Credit & source",
-                      value: `[Open on DeviantArt](${postUrl})`,
+                      value: `[Open the original source](${sourceUrl})`,
                       inline: false,
                     },
                   ],
                   image: { url: imageUrl },
                   footer: {
-                    text: "Non-mature result from DeviantArt",
+                    text: "Non-mature, openly licensed result from Openverse",
                   },
                 },
               ],
@@ -1093,15 +327,15 @@ jobs:
                     {
                       type: 2,
                       style: 1,
-                      custom_id: `another:${encodedTags}`,
+                      custom_id: `another:${encodedTerms}`,
                       label: "Another result",
                       emoji: { name: "🔄" },
                     },
                     {
                       type: 2,
                       style: 5,
-                      url: postUrl,
-                      label: "Open post",
+                      url: sourceUrl,
+                      label: "Open source",
                     },
                   ],
                 },
@@ -1109,42 +343,42 @@ jobs:
               allowed_mentions: { parse: [] },
             };
           }
-          
-          async function searchAndBuild(tags, env) {
-            const deviation = await findArtwork(tags, env);
-            if (!deviation) return null;
-            return buildArtworkMessage(deviation, tags);
+
+          async function searchAndBuild(terms) {
+            const item = await findArtwork(terms);
+            if (!item) return null;
+            return buildArtworkMessage(item, terms);
           }
-          
-          async function handleCommand(interaction, env) {
+
+          async function handleCommand(interaction) {
             if (interaction?.data?.name !== "furry") {
               return ephemeralMessage("Unknown command.");
             }
-          
+
             const queryOption = interaction?.data?.options?.find((option) => option.name === "query");
             const query = String(queryOption?.value ?? "");
-            const { tags, blocked } = tokenizeQuery(query);
-          
+            const { terms, blocked } = tokenizeQuery(query);
+
             if (blocked) {
               return ephemeralMessage(
-                "This bot only searches for safe artwork. Try a non-explicit description such as `blue wolf forest`.",
+                "This app only searches for non-explicit artwork. Try `blue wolf forest` instead.",
               );
             }
-          
-            if (tags.length === 0) {
+
+            if (terms.length === 0) {
               return ephemeralMessage(
-                "Give me one or two useful words, such as `cute fox`, `dragon armor`, or `blue wolf forest`.",
+                "Give me useful search words, such as `cute fox`, `dragon armor`, or `blue wolf forest`.",
               );
             }
-          
+
             try {
-              const message = await searchAndBuild(tags, env);
+              const message = await searchAndBuild(terms);
               if (!message) {
                 return ephemeralMessage(
-                  `No safe image result was found for \`${cleanText(tags.join(" "), 80)}\`. Try fewer or simpler words.`,
+                  `No openly licensed image was found for \`${cleanText(terms.join(" "), 80)}\`. Try fewer or simpler words.`,
                 );
               }
-          
+
               return json({
                 type: RESPONSE.CHANNEL_MESSAGE_WITH_SOURCE,
                 data: message,
@@ -1152,115 +386,97 @@ jobs:
             } catch (error) {
               console.error("Artwork search failed", error);
               const status = Number(error?.status ?? 0);
-              if (status >= 500) {
-                return ephemeralMessage(
-                  "DeviantArt is returning a temporary server error. The bot tried both search endpoints; please try again in a minute.",
-                );
+              if (status === 429) {
+                return ephemeralMessage("The image search service is temporarily rate-limiting requests. Try again shortly.");
               }
-              return ephemeralMessage("The artwork source did not respond correctly. Please try again shortly.");
+              return ephemeralMessage("The image search service did not respond correctly. Please try again shortly.");
             }
           }
-          
-          async function handleComponent(interaction, env) {
+
+          async function handleComponent(interaction) {
             const customId = String(interaction?.data?.custom_id ?? "");
             if (!customId.startsWith("another:")) {
               return ephemeralMessage("Unknown button.");
             }
-          
-            let decoded;
+
+            let decoded = "";
             try {
               decoded = decodeURIComponent(customId.slice("another:".length));
             } catch {
               decoded = "";
             }
-          
-            const tags = decoded.split(/\s+/).filter(Boolean).slice(0, 2);
-            if (tags.length === 0) {
+
+            const terms = decoded.split(/\s+/).filter(Boolean).slice(0, 6);
+            if (terms.length === 0) {
               return ephemeralMessage("The saved search was invalid. Run `/furry` again.");
             }
-          
+
             try {
-              const message = await searchAndBuild(tags, env);
+              const message = await searchAndBuild(terms);
               if (!message) {
-                return ephemeralMessage("No other safe result was found for that search.");
+                return ephemeralMessage("No other openly licensed result was found for that search.");
               }
-          
+
               return json({
                 type: RESPONSE.UPDATE_MESSAGE,
                 data: message,
               });
             } catch (error) {
               console.error("Artwork refresh failed", error);
-              return ephemeralMessage("The artwork source did not respond correctly. Please try again shortly.");
+              return ephemeralMessage("The image search service did not respond correctly. Please try again shortly.");
             }
           }
-          
+
           export default {
             async fetch(request, env) {
-              const requestUrl = new URL(request.url);
-              console.log("Worker invocation", request.method, requestUrl.pathname);
-          
-            if (request.method === "GET" && requestUrl.pathname === "/setup/deviantart") {
-              return handleDeviantArtSetup(request, env);
-            }
-          
-            if (request.method === "GET" && requestUrl.pathname === "/oauth/callback") {
-              return handleDeviantArtCallback(request, env);
-            }
-          
-            if (request.method === "GET" && requestUrl.pathname === "/debug/deviantart") {
-              const report = await runDeviantArtDiagnostics(env);
-              return json(report, report.ok ? 200 : 503);
-            }
-          
-            if (request.method === "GET") {
-              return new Response(
-                "Furry Art Finder is online. Setup: /setup/deviantart Diagnostic: /debug/deviantart",
-                { headers: { "content-type": "text/plain; charset=UTF-8" } },
-              );
-            }
-          
+              if (request.method === "GET") {
+                return new Response(
+                  "Furry Art Finder is online and using Openverse. Discord interactions use POST requests.",
+                  { headers: { "content-type": "text/plain; charset=UTF-8" } },
+                );
+              }
+
               if (request.method !== "POST") {
                 return new Response("Method Not Allowed", { status: 405 });
               }
-          
+
               if (!env.DISCORD_PUBLIC_KEY) {
                 console.error("DISCORD_PUBLIC_KEY is not configured");
                 return new Response("Server is not configured", { status: 500 });
               }
-          
+
               const signature = request.headers.get("x-signature-ed25519");
               const timestamp = request.headers.get("x-signature-timestamp");
               const rawBody = await request.text();
-          
+
               if (!signature || !timestamp) {
                 return new Response("Missing Discord signature", { status: 401 });
               }
-          
+
               const valid = await verifyKey(rawBody, signature, timestamp, env.DISCORD_PUBLIC_KEY);
               if (!valid) {
                 return new Response("Invalid request signature", { status: 401 });
               }
-          
+
               let interaction;
               try {
                 interaction = JSON.parse(rawBody);
               } catch {
                 return new Response("Invalid JSON", { status: 400 });
               }
-          
+
               if (interaction.type === INTERACTION.PING) {
                 return json({ type: RESPONSE.PONG });
               }
-          
+
               if (interaction.type === INTERACTION.APPLICATION_COMMAND) {
-                return handleCommand(interaction, env);
+                return handleCommand(interaction);
               }
-          
+
               if (interaction.type === INTERACTION.MESSAGE_COMPONENT) {
-                return handleComponent(interaction, env);
+                return handleComponent(interaction);
               }
-          
+
               return ephemeralMessage("Unsupported Discord interaction.");
             },
           };
@@ -1270,29 +486,22 @@ jobs:
           const applicationId = process.env.DISCORD_APPLICATION_ID;
           const botToken = process.env.DISCORD_BOT_TOKEN;
           const legacyGuildId = process.env.DISCORD_GUILD_ID?.trim();
-          
+
           if (!applicationId || !botToken) {
             console.error(
               "Missing DISCORD_APPLICATION_ID or DISCORD_BOT_TOKEN. Add them as GitHub Actions secrets.",
             );
             process.exit(1);
           }
-          
+
           const commands = [
             {
               name: "furry",
               type: 1,
-              description: "Find safe furry artwork from any DM, group DM, or server",
+              description: "Find non-mature, openly licensed furry artwork",
               nsfw: false,
-          
-              // USER_INSTALL: the app is installed to a person's Discord account,
-              // rather than being added as a member of a server.
               integration_types: [1],
-          
-              // GUILD, BOT_DM, PRIVATE_CHANNEL. PRIVATE_CHANNEL covers normal DMs
-              // and group DMs where the app itself is not a participant.
               contexts: [0, 1, 2],
-          
               options: [
                 {
                   type: 3,
@@ -1300,12 +509,12 @@ jobs:
                   description: "Example: blue wolf forest, cute fox, or dragon armor",
                   required: true,
                   min_length: 2,
-                  max_length: 60,
+                  max_length: 80,
                 },
               ],
             },
           ];
-          
+
           async function putCommands(endpoint, commandList) {
             const response = await fetch(endpoint, {
               method: "PUT",
@@ -1315,27 +524,20 @@ jobs:
               },
               body: JSON.stringify(commandList),
             });
-          
+
             const body = await response.text();
             if (!response.ok) {
               throw new Error(`Discord command registration failed (${response.status}): ${body}`);
             }
-          
-            return body;
           }
-          
+
           try {
-            // User-install commands must be global commands.
             await putCommands(
               `https://discord.com/api/v10/applications/${applicationId}/commands`,
               commands,
             );
-            console.log(
-              "Registered /furry globally for User Install in servers, bot DMs, normal DMs, and group DMs.",
-            );
-          
-            // If the old project had DISCORD_GUILD_ID configured, remove its obsolete
-            // server-scoped command so Discord does not show two copies while testing.
+            console.log("Registered /furry globally for User Install.");
+
             if (legacyGuildId) {
               await putCommands(
                 `https://discord.com/api/v10/applications/${applicationId}/guilds/${legacyGuildId}/commands`,
@@ -1369,25 +571,8 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           DISCORD_PUBLIC_KEY: ${{ secrets.DISCORD_PUBLIC_KEY }}
 
-      - name: Add DeviantArt client ID to Worker
-        shell: bash
-        run: printf '%s' "$DEVIANTART_CLIENT_ID" | npx wrangler secret put DEVIANTART_CLIENT_ID
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          DEVIANTART_CLIENT_ID: ${{ secrets.DEVIANTART_CLIENT_ID }}
-
-      - name: Add DeviantArt client secret to Worker
-        shell: bash
-        run: printf '%s' "$DEVIANTART_CLIENT_SECRET" | npx wrangler secret put DEVIANTART_CLIENT_SECRET
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          DEVIANTART_CLIENT_SECRET: ${{ secrets.DEVIANTART_CLIENT_SECRET }}
-
       - name: Register user-installed slash command
         run: npm run register
         env:
           DISCORD_APPLICATION_ID: ${{ secrets.DISCORD_APPLICATION_ID }}
           DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
-          
