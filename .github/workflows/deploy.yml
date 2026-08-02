@@ -1,3 +1,5 @@
+name: Deploy Shift Furry Bot (e621 Safe + NSFW)
+
 on:
   workflow_dispatch:
   push:
