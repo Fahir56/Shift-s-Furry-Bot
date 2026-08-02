@@ -1,0 +1,559 @@
+name: Deploy Furry Art Discord App
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: furry-art-user-app-production
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Generate application files
+        shell: bash
+        run: |
+          mkdir -p src scripts
+
+          cat > package.json <<'PACKAGE_EOF'
+          {
+            "name": "furry-art-discord-user-app",
+            "version": "1.0.0",
+            "private": true,
+            "type": "module",
+            "description": "A safe-only user-installed Discord app for searching furry artwork from DMs, group DMs, and servers.",
+            "scripts": {
+              "check": "node --check src/index.js && node --check scripts/register-commands.js",
+              "dev": "wrangler dev",
+              "deploy": "wrangler deploy",
+              "register": "node scripts/register-commands.js"
+            },
+            "dependencies": {
+              "discord-interactions": "4.4.0"
+            },
+            "devDependencies": {
+              "wrangler": "4.114.0"
+            },
+            "engines": {
+              "node": ">=20"
+            }
+          }
+          PACKAGE_EOF
+
+          cat > wrangler.jsonc <<'WRANGLER_EOF'
+          {
+            "$schema": "node_modules/wrangler/config-schema.json",
+            "name": "furry-art-finder-app",
+            "main": "src/index.js",
+            "compatibility_date": "2026-08-02",
+            "compatibility_flags": ["nodejs_compat"],
+            "workers_dev": true,
+            "observability": {
+              "enabled": true
+            }
+          }
+          WRANGLER_EOF
+
+          cat > src/index.js <<'WORKER_EOF'
+          import { verifyKey } from "discord-interactions";
+          
+          const INTERACTION = Object.freeze({
+            PING: 1,
+            APPLICATION_COMMAND: 2,
+            MESSAGE_COMPONENT: 3,
+          });
+          
+          const RESPONSE = Object.freeze({
+            PONG: 1,
+            CHANNEL_MESSAGE_WITH_SOURCE: 4,
+            UPDATE_MESSAGE: 7,
+          });
+          
+          const EPHEMERAL = 1 << 6;
+          const E926_BASE = "https://e926.net";
+          const USER_AGENT =
+            "FurryArtFinderDiscordBot/1.0 (safe artwork search; deployed from GitHub)";
+          
+          const STOP_WORDS = new Set([
+            "a",
+            "an",
+            "and",
+            "art",
+            "artwork",
+            "drawing",
+            "furry",
+            "for",
+            "from",
+            "in",
+            "of",
+            "on",
+            "picture",
+            "please",
+            "show",
+            "the",
+            "to",
+            "with",
+          ]);
+          
+          const BLOCKED_WORDS = new Set([
+            "adult",
+            "explicit",
+            "fetish",
+            "naked",
+            "nude",
+            "nsfw",
+            "porn",
+            "pornographic",
+            "sex",
+            "sexual",
+            "yiff",
+          ]);
+          
+          const FUR_COLORS = new Set([
+            "black",
+            "blue",
+            "brown",
+            "cyan",
+            "gray",
+            "green",
+            "grey",
+            "orange",
+            "pink",
+            "purple",
+            "red",
+            "tan",
+            "teal",
+            "white",
+            "yellow",
+          ]);
+          
+          function json(data, status = 200) {
+            return new Response(JSON.stringify(data), {
+              status,
+              headers: {
+                "content-type": "application/json; charset=UTF-8",
+                "cache-control": "no-store",
+              },
+            });
+          }
+          
+          function ephemeralMessage(content) {
+            return json({
+              type: RESPONSE.CHANNEL_MESSAGE_WITH_SOURCE,
+              data: { content, flags: EPHEMERAL },
+            });
+          }
+          
+          function cleanText(value, maxLength) {
+            return String(value ?? "")
+              .replace(/[\u0000-\u001F\u007F]/g, " ")
+              .replace(/\s+/g, " ")
+              .trim()
+              .slice(0, maxLength);
+          }
+          
+          function tokenizeQuery(input) {
+            const raw = cleanText(input, 60).toLowerCase();
+            if (!raw) return { tags: [], blocked: false };
+          
+            const pieces = raw.match(/"[^"]+"|'[^']+'|\S+/g) ?? [];
+            const tokens = [];
+            let blocked = false;
+          
+            for (const piece of pieces) {
+              const withoutQuotes = piece.replace(/^['"]|['"]$/g, "");
+              const normalized = withoutQuotes
+                .normalize("NFKD")
+                .replace(/[^a-z0-9 _-]/g, "")
+                .replace(/[-\s]+/g, "_")
+                .replace(/^_+|_+$/g, "")
+                .slice(0, 30);
+          
+              if (!normalized) continue;
+          
+              const words = normalized.split("_");
+              if (words.some((word) => BLOCKED_WORDS.has(word))) {
+                blocked = true;
+                continue;
+              }
+          
+              if (STOP_WORDS.has(normalized)) continue;
+              tokens.push(normalized);
+            }
+          
+            const unique = [...new Set(tokens)];
+            if (unique.length >= 2 && FUR_COLORS.has(unique[0])) {
+              unique[0] = `${unique[0]}_fur`;
+            }
+          
+            // Anonymous searches on booru-style APIs are most reliable with a small
+            // number of normal tags. Keep the two strongest words from the sentence.
+            return { tags: unique.slice(0, 2), blocked };
+          }
+          
+          function imageUrlFor(post) {
+            const candidates = [post?.sample?.url, post?.file?.url, post?.preview?.url];
+            return candidates.find((value) => typeof value === "string" && value.startsWith("https://"));
+          }
+          
+          function isDisplayableImage(post) {
+            const extension = String(post?.file?.ext ?? "").toLowerCase();
+            return ["jpg", "jpeg", "png", "gif", "webp"].includes(extension) && Boolean(imageUrlFor(post));
+          }
+          
+          async function findArtwork(tags) {
+            const searchTags = [...tags, "order:random"].join(" ");
+            const url = new URL(`${E926_BASE}/posts.json`);
+            url.searchParams.set("limit", "30");
+            url.searchParams.set("tags", searchTags);
+          
+            const response = await fetch(url, {
+              headers: {
+                accept: "application/json",
+                "user-agent": USER_AGENT,
+              },
+              cf: {
+                cacheTtl: 15,
+                cacheEverything: true,
+              },
+            });
+          
+            if (!response.ok) {
+              throw new Error(`Artwork source returned HTTP ${response.status}`);
+            }
+          
+            const payload = await response.json();
+            const posts = Array.isArray(payload?.posts) ? payload.posts : [];
+            const usable = posts.filter(isDisplayableImage);
+            if (usable.length === 0) return null;
+          
+            return usable[Math.floor(Math.random() * usable.length)];
+          }
+          
+          function buildArtworkMessage(post, tags) {
+            const artists = Array.isArray(post?.tags?.artist)
+              ? post.tags.artist.filter((tag) => tag !== "conditional_dnp").slice(0, 4)
+              : [];
+            const artistText = artists.length
+              ? artists.map((artist) => artist.replaceAll("_", " ")).join(", ")
+              : "Unknown / untagged";
+          
+            const postUrl = `${E926_BASE}/posts/${post.id}`;
+            const imageUrl = imageUrlFor(post);
+            const score = Number(post?.score?.total ?? 0);
+            const matchedTags = tags.join(" ");
+            const encodedTags = encodeURIComponent(matchedTags).slice(0, 78);
+          
+            return {
+              embeds: [
+                {
+                  title: "Safe furry artwork",
+                  url: postUrl,
+                  description: `Search: \`${cleanText(matchedTags, 80)}\``,
+                  fields: [
+                    {
+                      name: "Artist tag",
+                      value: cleanText(artistText, 200) || "Unknown / untagged",
+                      inline: true,
+                    },
+                    {
+                      name: "Score",
+                      value: String(score),
+                      inline: true,
+                    },
+                    {
+                      name: "Credit & source",
+                      value: `[Open the artwork post](${postUrl})`,
+                      inline: false,
+                    },
+                  ],
+                  image: { url: imageUrl },
+                  footer: {
+                    text: `Safe-only result • post ${post.id}`,
+                  },
+                },
+              ],
+              components: [
+                {
+                  type: 1,
+                  components: [
+                    {
+                      type: 2,
+                      style: 1,
+                      custom_id: `another:${encodedTags}`,
+                      label: "Another result",
+                      emoji: { name: "🔄" },
+                    },
+                    {
+                      type: 2,
+                      style: 5,
+                      url: postUrl,
+                      label: "Open post",
+                    },
+                  ],
+                },
+              ],
+              allowed_mentions: { parse: [] },
+            };
+          }
+          
+          async function searchAndBuild(tags) {
+            const post = await findArtwork(tags);
+            if (!post) return null;
+            return buildArtworkMessage(post, tags);
+          }
+          
+          async function handleCommand(interaction) {
+            if (interaction?.data?.name !== "furry") {
+              return ephemeralMessage("Unknown command.");
+            }
+          
+            const queryOption = interaction?.data?.options?.find((option) => option.name === "query");
+            const query = String(queryOption?.value ?? "");
+            const { tags, blocked } = tokenizeQuery(query);
+          
+            if (blocked) {
+              return ephemeralMessage(
+                "This bot only searches for safe artwork. Try a non-explicit description such as `blue wolf forest`.",
+              );
+            }
+          
+            if (tags.length === 0) {
+              return ephemeralMessage(
+                "Give me one or two useful words, such as `cute fox`, `dragon armor`, or `blue wolf forest`.",
+              );
+            }
+          
+            try {
+              const message = await searchAndBuild(tags);
+              if (!message) {
+                return ephemeralMessage(
+                  `No safe image result was found for \`${cleanText(tags.join(" "), 80)}\`. Try fewer or simpler words.`,
+                );
+              }
+          
+              return json({
+                type: RESPONSE.CHANNEL_MESSAGE_WITH_SOURCE,
+                data: message,
+              });
+            } catch (error) {
+              console.error("Artwork search failed", error);
+              return ephemeralMessage("The artwork source did not respond correctly. Please try again shortly.");
+            }
+          }
+          
+          async function handleComponent(interaction) {
+            const customId = String(interaction?.data?.custom_id ?? "");
+            if (!customId.startsWith("another:")) {
+              return ephemeralMessage("Unknown button.");
+            }
+          
+            let decoded;
+            try {
+              decoded = decodeURIComponent(customId.slice("another:".length));
+            } catch {
+              decoded = "";
+            }
+          
+            const tags = decoded.split(/\s+/).filter(Boolean).slice(0, 2);
+            if (tags.length === 0) {
+              return ephemeralMessage("The saved search was invalid. Run `/furry` again.");
+            }
+          
+            try {
+              const message = await searchAndBuild(tags);
+              if (!message) {
+                return ephemeralMessage("No other safe result was found for that search.");
+              }
+          
+              return json({
+                type: RESPONSE.UPDATE_MESSAGE,
+                data: message,
+              });
+            } catch (error) {
+              console.error("Artwork refresh failed", error);
+              return ephemeralMessage("The artwork source did not respond correctly. Please try again shortly.");
+            }
+          }
+          
+          export default {
+            async fetch(request, env) {
+              if (request.method === "GET") {
+                return new Response(
+                  "Furry Art Finder user app is online. Discord interactions must use POST requests.",
+                  { headers: { "content-type": "text/plain; charset=UTF-8" } },
+                );
+              }
+          
+              if (request.method !== "POST") {
+                return new Response("Method Not Allowed", { status: 405 });
+              }
+          
+              if (!env.DISCORD_PUBLIC_KEY) {
+                console.error("DISCORD_PUBLIC_KEY is not configured");
+                return new Response("Server is not configured", { status: 500 });
+              }
+          
+              const signature = request.headers.get("x-signature-ed25519");
+              const timestamp = request.headers.get("x-signature-timestamp");
+              const rawBody = await request.text();
+          
+              if (!signature || !timestamp) {
+                return new Response("Missing Discord signature", { status: 401 });
+              }
+          
+              const valid = await verifyKey(rawBody, signature, timestamp, env.DISCORD_PUBLIC_KEY);
+              if (!valid) {
+                return new Response("Invalid request signature", { status: 401 });
+              }
+          
+              let interaction;
+              try {
+                interaction = JSON.parse(rawBody);
+              } catch {
+                return new Response("Invalid JSON", { status: 400 });
+              }
+          
+              if (interaction.type === INTERACTION.PING) {
+                return json({ type: RESPONSE.PONG });
+              }
+          
+              if (interaction.type === INTERACTION.APPLICATION_COMMAND) {
+                return handleCommand(interaction);
+              }
+          
+              if (interaction.type === INTERACTION.MESSAGE_COMPONENT) {
+                return handleComponent(interaction);
+              }
+          
+              return ephemeralMessage("Unsupported Discord interaction.");
+            },
+          };
+          WORKER_EOF
+
+          cat > scripts/register-commands.js <<'REGISTER_EOF'
+          const applicationId = process.env.DISCORD_APPLICATION_ID;
+          const botToken = process.env.DISCORD_BOT_TOKEN;
+          const legacyGuildId = process.env.DISCORD_GUILD_ID?.trim();
+          
+          if (!applicationId || !botToken) {
+            console.error(
+              "Missing DISCORD_APPLICATION_ID or DISCORD_BOT_TOKEN. Add them as GitHub Actions secrets.",
+            );
+            process.exit(1);
+          }
+          
+          const commands = [
+            {
+              name: "furry",
+              type: 1,
+              description: "Find safe furry artwork from any DM, group DM, or server",
+              nsfw: false,
+          
+              // USER_INSTALL: the app is installed to a person's Discord account,
+              // rather than being added as a member of a server.
+              integration_types: [1],
+          
+              // GUILD, BOT_DM, PRIVATE_CHANNEL. PRIVATE_CHANNEL covers normal DMs
+              // and group DMs where the app itself is not a participant.
+              contexts: [0, 1, 2],
+          
+              options: [
+                {
+                  type: 3,
+                  name: "query",
+                  description: "Example: blue wolf forest, cute fox, or dragon armor",
+                  required: true,
+                  min_length: 2,
+                  max_length: 60,
+                },
+              ],
+            },
+          ];
+          
+          async function putCommands(endpoint, commandList) {
+            const response = await fetch(endpoint, {
+              method: "PUT",
+              headers: {
+                Authorization: `Bot ${botToken}`,
+                "Content-Type": "application/json",
+              },
+              body: JSON.stringify(commandList),
+            });
+          
+            const body = await response.text();
+            if (!response.ok) {
+              throw new Error(`Discord command registration failed (${response.status}): ${body}`);
+            }
+          
+            return body;
+          }
+          
+          try {
+            // User-install commands must be global commands.
+            await putCommands(
+              `https://discord.com/api/v10/applications/${applicationId}/commands`,
+              commands,
+            );
+            console.log(
+              "Registered /furry globally for User Install in servers, bot DMs, normal DMs, and group DMs.",
+            );
+          
+            // If the old project had DISCORD_GUILD_ID configured, remove its obsolete
+            // server-scoped command so Discord does not show two copies while testing.
+            if (legacyGuildId) {
+              await putCommands(
+                `https://discord.com/api/v10/applications/${applicationId}/guilds/${legacyGuildId}/commands`,
+                [],
+              );
+              console.log(`Removed legacy guild commands from ${legacyGuildId}.`);
+            }
+          } catch (error) {
+            console.error(error instanceof Error ? error.message : error);
+            process.exit(1);
+          }
+          REGISTER_EOF
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Validate JavaScript
+        run: npm run check
+
+      - name: Deploy Cloudflare Worker
+        run: npx wrangler deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+      - name: Add Discord public key to Worker
+        shell: bash
+        run: printf '%s' "$DISCORD_PUBLIC_KEY" | npx wrangler secret put DISCORD_PUBLIC_KEY
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          DISCORD_PUBLIC_KEY: ${{ secrets.DISCORD_PUBLIC_KEY }}
+
+      - name: Register user-installed slash command
+        run: npm run register
+        env:
+          DISCORD_APPLICATION_ID: ${{ secrets.DISCORD_APPLICATION_ID }}
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          
