@@ -89,7 +89,7 @@ jobs:
           const EPHEMERAL = 1 << 6;
           const E926_BASE = "https://e926.net";
           const USER_AGENT =
-            "FurryArtFinderDiscordBot/1.0 (safe artwork search; deployed from GitHub)";
+            "ShiftFurrySearch/1.1 (by Fahir56 on GitHub; safe artwork search)";
           
           const STOP_WORDS = new Set([
             "a",
@@ -219,27 +219,46 @@ jobs:
           }
           
           async function findArtwork(tags) {
-            const searchTags = [...tags, "order:random"].join(" ");
+            // Do not use order:random here. It is currently unreliable on e926/e621
+            // and can make the API reject an otherwise valid search. We request a
+            // larger normal result page and randomize the result inside the Worker.
+            const searchTags = tags.join(" ");
             const url = new URL(`${E926_BASE}/posts.json`);
-            url.searchParams.set("limit", "30");
+            url.searchParams.set("limit", "100");
             url.searchParams.set("tags", searchTags);
           
             const response = await fetch(url, {
               headers: {
                 accept: "application/json",
+                "accept-language": "en-US,en;q=0.8",
                 "user-agent": USER_AGENT,
               },
-              cf: {
-                cacheTtl: 15,
-                cacheEverything: true,
-              },
+              redirect: "follow",
             });
           
+            const body = await response.text();
             if (!response.ok) {
+              console.error(
+                "e926 request failed",
+                response.status,
+                response.headers.get("content-type"),
+                body.slice(0, 300),
+              );
               throw new Error(`Artwork source returned HTTP ${response.status}`);
             }
           
-            const payload = await response.json();
+            let payload;
+            try {
+              payload = JSON.parse(body);
+            } catch {
+              console.error(
+                "e926 returned non-JSON",
+                response.headers.get("content-type"),
+                body.slice(0, 300),
+              );
+              throw new Error("Artwork source returned invalid JSON");
+            }
+          
             const posts = Array.isArray(payload?.posts) ? payload.posts : [];
             const usable = posts.filter(isDisplayableImage);
             if (usable.length === 0) return null;
@@ -556,4 +575,6 @@ jobs:
         env:
           DISCORD_APPLICATION_ID: ${{ secrets.DISCORD_APPLICATION_ID }}
           DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          
+            
           
