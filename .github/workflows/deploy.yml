@@ -309,21 +309,39 @@ jobs:
             return new Promise((resolve) => setTimeout(resolve, milliseconds));
           }
 
-          function deviantArtHeaders(token) {
+          function deviantArtHeaders() {
             return {
               accept: "application/json",
               "accept-encoding": "gzip, br",
-              authorization: `Bearer ${token}`,
               "user-agent": USER_AGENT,
-              "dA-minor-version": "20240701",
             };
           }
 
+          function authenticatedDeviantArtUrl(url, token) {
+            const authenticatedUrl = new URL(url.toString());
+            authenticatedUrl.searchParams.set("access_token", token);
+            return authenticatedUrl;
+          }
+
+          function safeDeviantArtUrlForLog(url) {
+            const safeUrl = new URL(url.toString());
+            if (safeUrl.searchParams.has("access_token")) {
+              safeUrl.searchParams.set("access_token", "[REDACTED]");
+            }
+            return safeUrl.toString();
+          }
+
           async function requestDeviantArtJson(url, token, label, maxAttempts = 3) {
+            const authenticatedUrl = authenticatedDeviantArtUrl(url, token);
             for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-              console.log("DeviantArt request", label, `attempt=${attempt}`, url.toString());
-              const response = await fetch(url, {
-                headers: deviantArtHeaders(token),
+              console.log(
+                "DeviantArt request",
+                label,
+                `attempt=${attempt}`,
+                safeDeviantArtUrlForLog(authenticatedUrl),
+              );
+              const response = await fetch(authenticatedUrl, {
+                headers: deviantArtHeaders(),
               });
               const body = await response.text();
 
@@ -484,24 +502,59 @@ jobs:
             }
 
             const tests = [
-              { name: "placebo", url: new URL(DEVIANTART_PLACEBO_URL) },
+              {
+                name: "placebo:form",
+                url: new URL(DEVIANTART_PLACEBO_URL),
+                method: "POST",
+                body: new URLSearchParams({ access_token: token }).toString(),
+              },
+              {
+                name: "placebo:query",
+                url: authenticatedDeviantArtUrl(new URL(DEVIANTART_PLACEBO_URL), token),
+                method: "GET",
+              },
               {
                 name: "tag:furry",
-                url: new URL(`${DEVIANTART_TAG_URL}?tag=furry&limit=5&offset=0&mature_content=false&with_session=false`),
+                url: authenticatedDeviantArtUrl(
+                  new URL(`${DEVIANTART_TAG_URL}?tag=furry&limit=5&offset=0&mature_content=false&with_session=false`),
+                  token,
+                ),
+                method: "GET",
               },
               {
                 name: "newest:furry",
-                url: new URL(`${DEVIANTART_SEARCH_ENDPOINTS[0]}?q=furry&limit=5&offset=0&mature_content=false&with_session=false`),
+                url: authenticatedDeviantArtUrl(
+                  new URL(`${DEVIANTART_SEARCH_ENDPOINTS[0]}?q=furry&limit=5&offset=0&mature_content=false&with_session=false`),
+                  token,
+                ),
+                method: "GET",
               },
               {
                 name: "popular:furry",
-                url: new URL(`${DEVIANTART_SEARCH_ENDPOINTS[1]}?q=furry&timerange=alltime&limit=5&offset=0&mature_content=false&with_session=false`),
+                url: authenticatedDeviantArtUrl(
+                  new URL(`${DEVIANTART_SEARCH_ENDPOINTS[1]}?q=furry&timerange=alltime&limit=5&offset=0&mature_content=false&with_session=false`),
+                  token,
+                ),
+                method: "GET",
               },
             ];
 
             for (const test of tests) {
               try {
-                const response = await fetch(test.url, { headers: deviantArtHeaders(token) });
+                const headers = deviantArtHeaders();
+                if (test.method === "POST") {
+                  headers["content-type"] = "application/x-www-form-urlencoded";
+                }
+                console.log(
+                  "DeviantArt diagnostic request",
+                  test.name,
+                  safeDeviantArtUrlForLog(test.url),
+                );
+                const response = await fetch(test.url, {
+                  method: test.method,
+                  headers,
+                  body: test.body,
+                });
                 const body = await response.text();
                 let resultCount = null;
                 try {
@@ -525,7 +578,9 @@ jobs:
               }
             }
 
-            report.ok = report.tests.some((test) => test.name.startsWith("tag:") && test.ok);
+            report.ok = report.tests.some(
+              (test) => ["tag:furry", "newest:furry", "popular:furry"].includes(test.name) && test.ok,
+            );
             return report;
           }
 
@@ -857,5 +912,3 @@ jobs:
         env:
           DISCORD_APPLICATION_ID: ${{ secrets.DISCORD_APPLICATION_ID }}
           DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
-          
-        
