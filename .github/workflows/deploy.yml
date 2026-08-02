@@ -889,29 +889,40 @@ jobs:
         env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
 
-      - name: Deploy to Vercel
+      - name: Deploy to Vercel and assign public production domain
         id: vercel
         shell: bash
         run: |
+          set -euo pipefail
+
+          # Vercel's unique generated deployment URL can be protected by Vercel
+          # Authentication. Discord needs a public webhook, so use the stable
+          # production domain instead.
+          PROJECT_DOMAIN="shift-furry-search-fahir56.vercel.app"
+
           DEPLOY_URL="$(
             npx vercel deploy --prod --yes --token="$VERCEL_TOKEN" \
               --env "DISCORD_PUBLIC_KEY=$DISCORD_PUBLIC_KEY"
           )"
-          echo "Deployment URL: $DEPLOY_URL"
+
+          echo "Unique deployment URL: $DEPLOY_URL"
+          echo "Assigning public production domain: https://$PROJECT_DOMAIN"
+          npx vercel alias set "$DEPLOY_URL" "$PROJECT_DOMAIN" \
+            --token="$VERCEL_TOKEN"
+
           echo "deployment_url=$DEPLOY_URL" >> "$GITHUB_OUTPUT"
+          echo "public_base_url=https://$PROJECT_DOMAIN" >> "$GITHUB_OUTPUT"
         env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
           DISCORD_PUBLIC_KEY: ${{ secrets.DISCORD_PUBLIC_KEY }}
 
-      - name: Verify e926 and e621 from Vercel
+      - name: Verify e926 and e621 from public Vercel domain
         shell: bash
         run: |
           set -euo pipefail
-          HEALTH_URL="${{ steps.vercel.outputs.deployment_url }}/health?q=blue%20wolf"
+          HEALTH_URL="${{ steps.vercel.outputs.public_base_url }}/health?q=blue%20wolf"
           echo "Testing $HEALTH_URL"
 
-          # Vercel may redirect the raw deployment URL to its canonical production URL.
-          # Follow that redirect before trying to parse the response as JSON.
           curl \
             --location \
             --max-redirs 5 \
@@ -932,7 +943,7 @@ jobs:
           try {
             report = JSON.parse(raw);
           } catch (error) {
-            console.error("The Vercel health endpoint did not return JSON.");
+            console.error("The public Vercel health endpoint did not return JSON.");
             console.error("Response preview:", raw.slice(0, 500));
             process.exit(1);
           }
@@ -944,9 +955,9 @@ jobs:
           }
           NODE_EOF
 
-      - name: Point Discord to Vercel and register commands
+      - name: Point Discord to public Vercel domain and register commands
         run: node scripts/configure-discord.js
         env:
           DISCORD_APPLICATION_ID: ${{ secrets.DISCORD_APPLICATION_ID }}
           DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
-          INTERACTIONS_ENDPOINT_URL: ${{ steps.vercel.outputs.deployment_url }}/api/interactions
+          INTERACTIONS_ENDPOINT_URL: ${{ steps.vercel.outputs.public_base_url }}/api/interactions
