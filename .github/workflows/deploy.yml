@@ -1,5 +1,3 @@
-hift Furry Bot (Safe + NSFW)
-
 on:
   workflow_dispatch:
   push:
