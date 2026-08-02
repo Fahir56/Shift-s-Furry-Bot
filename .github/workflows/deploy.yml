@@ -492,12 +492,6 @@ jobs:
                   "DeviantArt is returning a temporary server error. The bot tried both search endpoints; please try again in a minute.",
                 );
               }
-              const status = Number(error?.status ?? 0);
-              if (status >= 500) {
-                return ephemeralMessage(
-                  "DeviantArt is returning a temporary server error. Please run `/furry` again in a minute.",
-                );
-              }
               return ephemeralMessage("The artwork source did not respond correctly. Please try again shortly.");
             }
           }
@@ -715,5 +709,4 @@ jobs:
         env:
           DISCORD_APPLICATION_ID: ${{ secrets.DISCORD_APPLICATION_ID }}
           DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
-          
           
