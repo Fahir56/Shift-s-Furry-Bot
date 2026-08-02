@@ -1,4 +1,4 @@
-name: Deploy Furry Art Discord App (DeviantArt Diagnostic)
+name: Deploy Furry Art Discord App (DeviantArt OAuth 2.1)
 
 on:
   workflow_dispatch:
@@ -91,6 +91,7 @@ jobs:
           });
           
           const EPHEMERAL = 1 << 6;
+          const DEVIANTART_AUTHORIZE_URL = "https://www.deviantart.com/oauth2/authorize";
           const DEVIANTART_TOKEN_URL = "https://www.deviantart.com/oauth2/token";
           const DEVIANTART_PLACEBO_URL = "https://www.deviantart.com/api/v1/oauth2/placebo";
           const DEVIANTART_TAG_URL = "https://www.deviantart.com/api/v1/oauth2/browse/tags";
@@ -99,10 +100,15 @@ jobs:
             "https://www.deviantart.com/api/v1/oauth2/browse/popular",
           ];
           const USER_AGENT =
-            "ShiftFurrySearch/2.0 (by Fahir56 on GitHub; non-mature art search)";
-
+            "ShiftFurrySearch/3.0 (by Fahir56 on GitHub; non-mature art search)";
+          const WORKER_ORIGIN = "https://furry-art-finder-app.hsa94110.workers.dev";
+          const DEVIANTART_REDIRECT_URI = `${WORKER_ORIGIN}/oauth/callback`;
+          const API_MINOR_VERSION = "20240701";
+          
           let cachedDeviantArtToken = null;
           let cachedDeviantArtTokenExpiresAt = 0;
+          let cachedDeviantArtTokenSource = null;
+          let cachedDeviantArtTokenMetadata = null;
           
           const STOP_WORDS = new Set([
             "a",
@@ -212,7 +218,7 @@ jobs:
             }
           
             const unique = [...new Set(tokens)];
-
+          
             // DeviantArt accepts a normal text query. Keep enough words to preserve
             // the user's description while preventing very long search strings.
             return { tags: unique.slice(0, 5), blocked };
@@ -224,7 +230,7 @@ jobs:
               .filter(Boolean)
               .join(" ");
           }
-
+          
           function imageUrlFor(deviation) {
             const candidates = [
               deviation?.content?.src,
@@ -235,7 +241,7 @@ jobs:
               (value) => typeof value === "string" && value.startsWith("https://"),
             );
           }
-
+          
           function isDisplayableArtwork(deviation) {
             return (
               deviation?.is_mature === false &&
@@ -245,106 +251,416 @@ jobs:
               deviation.url.startsWith("https://")
             );
           }
-
-          async function getDeviantArtToken(env) {
-            const now = Date.now();
-            if (cachedDeviantArtToken && now < cachedDeviantArtTokenExpiresAt) {
-              return cachedDeviantArtToken;
-            }
-
-            if (!env.DEVIANTART_CLIENT_ID || !env.DEVIANTART_CLIENT_SECRET) {
-              throw new Error(
-                "DEVIANTART_CLIENT_ID or DEVIANTART_CLIENT_SECRET is not configured",
-              );
-            }
-
-            const form = new URLSearchParams({
-              grant_type: "client_credentials",
-              client_id: env.DEVIANTART_CLIENT_ID,
-              client_secret: env.DEVIANTART_CLIENT_SECRET,
-            });
-
-            const response = await fetch(DEVIANTART_TOKEN_URL, {
-              method: "POST",
-              headers: {
-                accept: "application/json",
-                "content-type": "application/x-www-form-urlencoded",
-                "user-agent": USER_AGENT,
-              },
-              body: form.toString(),
-            });
-
-            const body = await response.text();
-            if (!response.ok) {
-              console.error(
-                "DeviantArt token request failed",
-                response.status,
-                response.headers.get("content-type"),
-                body.slice(0, 300),
-              );
-              throw new Error(`DeviantArt token request returned HTTP ${response.status}`);
-            }
-
-            let payload;
-            try {
-              payload = JSON.parse(body);
-            } catch {
-              console.error("DeviantArt token response was not JSON", body.slice(0, 300));
-              throw new Error("DeviantArt token response was invalid");
-            }
-
-            if (typeof payload?.access_token !== "string") {
-              console.error("DeviantArt token response had no access_token", payload);
-              throw new Error("DeviantArt token response had no access token");
-            }
-
-            const expiresInSeconds = Math.max(60, Number(payload?.expires_in ?? 3600));
-            cachedDeviantArtToken = payload.access_token;
-            cachedDeviantArtTokenExpiresAt =
-              now + Math.max(60, expiresInSeconds - 120) * 1000;
-            return cachedDeviantArtToken;
-          }
-
+          
           function sleep(milliseconds) {
             return new Promise((resolve) => setTimeout(resolve, milliseconds));
           }
-
-          function deviantArtHeaders() {
+          
+          function bytesToBase64Url(bytes) {
+            let binary = "";
+            for (let offset = 0; offset < bytes.length; offset += 0x8000) {
+              binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
+            }
+            return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/g, "");
+          }
+          
+          function textToBase64Url(text) {
+            return bytesToBase64Url(new TextEncoder().encode(text));
+          }
+          
+          function base64UrlToText(value) {
+            const normalized = value.replaceAll("-", "+").replaceAll("_", "/");
+            const padded = normalized + "=".repeat((4 - (normalized.length % 4)) % 4);
+            const binary = atob(padded);
+            const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+            return new TextDecoder().decode(bytes);
+          }
+          
+          function randomBase64Url(byteLength = 32) {
+            const bytes = new Uint8Array(byteLength);
+            crypto.getRandomValues(bytes);
+            return bytesToBase64Url(bytes);
+          }
+          
+          async function sha256Base64Url(value) {
+            const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+            return bytesToBase64Url(new Uint8Array(digest));
+          }
+          
+          async function hmacBase64Url(secret, value) {
+            const key = await crypto.subtle.importKey(
+              "raw",
+              new TextEncoder().encode(secret),
+              { name: "HMAC", hash: "SHA-256" },
+              false,
+              ["sign"],
+            );
+            const signature = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(value));
+            return bytesToBase64Url(new Uint8Array(signature));
+          }
+          
+          function constantTimeTextEqual(left, right) {
+            if (left.length !== right.length) return false;
+            let difference = 0;
+            for (let index = 0; index < left.length; index += 1) {
+              difference |= left.charCodeAt(index) ^ right.charCodeAt(index);
+            }
+            return difference === 0;
+          }
+          
+          function parseCookies(request) {
+            const result = {};
+            for (const pair of String(request.headers.get("cookie") ?? "").split(";")) {
+              const separator = pair.indexOf("=");
+              if (separator < 1) continue;
+              const key = pair.slice(0, separator).trim();
+              const value = pair.slice(separator + 1).trim();
+              if (key) result[key] = value;
+            }
+            return result;
+          }
+          
+          async function createSignedOauthCookie(payload, secret) {
+            const encoded = textToBase64Url(JSON.stringify(payload));
+            const signature = await hmacBase64Url(secret, encoded);
+            return `${encoded}.${signature}`;
+          }
+          
+          async function readSignedOauthCookie(value, secret) {
+            const [encoded, signature, extra] = String(value ?? "").split(".");
+            if (!encoded || !signature || extra) return null;
+            const expected = await hmacBase64Url(secret, encoded);
+            if (!constantTimeTextEqual(signature, expected)) return null;
+            try {
+              const payload = JSON.parse(base64UrlToText(encoded));
+              if (Number(payload?.expires_at ?? 0) < Date.now()) return null;
+              return payload;
+            } catch {
+              return null;
+            }
+          }
+          
+          function htmlEscape(value) {
+            return String(value ?? "")
+              .replaceAll("&", "&amp;")
+              .replaceAll("<", "&lt;")
+              .replaceAll(">", "&gt;")
+              .replaceAll('"', "&quot;")
+              .replaceAll("'", "&#39;");
+          }
+          
+          function htmlPage(title, body, status = 200, extraHeaders = {}) {
+            return new Response(
+              `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${htmlEscape(title)}</title><style>body{font-family:system-ui,sans-serif;max-width:760px;margin:36px auto;padding:0 18px;line-height:1.5;background:#111;color:#eee}code,pre{background:#222;border-radius:8px;padding:10px;display:block;overflow-wrap:anywhere;white-space:pre-wrap}a{color:#8ab4ff}.ok{color:#79d279}.bad{color:#ff8c8c}</style></head><body><h1>${htmlEscape(title)}</h1>${body}</body></html>`,
+              {
+                status,
+                headers: {
+                  "content-type": "text/html; charset=UTF-8",
+                  "cache-control": "no-store, private",
+                  ...extraHeaders,
+                },
+              },
+            );
+          }
+          
+          function deviantArtBaseHeaders() {
             return {
               accept: "application/json",
               "accept-encoding": "gzip, br",
               "user-agent": USER_AGENT,
             };
           }
-
-          function authenticatedDeviantArtUrl(url, token) {
-            const authenticatedUrl = new URL(url.toString());
-            authenticatedUrl.searchParams.set("access_token", token);
-            return authenticatedUrl;
+          
+          function isAllowedDeviantArtRedirect(url) {
+            const hostname = new URL(url).hostname.toLowerCase();
+            return hostname === "deviantart.com" || hostname === "www.deviantart.com" || hostname.endsWith(".deviantart.com");
           }
-
-          function safeDeviantArtUrlForLog(url) {
-            const safeUrl = new URL(url.toString());
-            if (safeUrl.searchParams.has("access_token")) {
-              safeUrl.searchParams.set("access_token", "[REDACTED]");
-            }
-            return safeUrl.toString();
-          }
-
-          async function requestDeviantArtJson(url, token, label, maxAttempts = 3) {
-            const authenticatedUrl = authenticatedDeviantArtUrl(url, token);
-            for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-              console.log(
-                "DeviantArt request",
-                label,
-                `attempt=${attempt}`,
-                safeDeviantArtUrlForLog(authenticatedUrl),
-              );
-              const response = await fetch(authenticatedUrl, {
-                headers: deviantArtHeaders(),
+          
+          async function fetchDeviantArtWithBearer(url, token, options = {}) {
+            let currentUrl = new URL(url.toString());
+            for (let redirectCount = 0; redirectCount <= 3; redirectCount += 1) {
+              const headers = new Headers(options.headers ?? {});
+              for (const [name, value] of Object.entries(deviantArtBaseHeaders())) {
+                if (!headers.has(name)) headers.set(name, value);
+              }
+              headers.set("Authorization", `Bearer ${token}`);
+              headers.set("dA-minor-version", API_MINOR_VERSION);
+          
+              const response = await fetch(currentUrl, {
+                ...options,
+                headers,
+                redirect: "manual",
               });
+          
+              if (![301, 302, 303, 307, 308].includes(response.status)) return response;
+              const location = response.headers.get("location");
+              if (!location) return response;
+              const nextUrl = new URL(location, currentUrl);
+              console.warn("DeviantArt redirect", currentUrl.toString(), "->", nextUrl.toString());
+              if (nextUrl.protocol !== "https:" || !isAllowedDeviantArtRedirect(nextUrl)) {
+                throw new Error("DeviantArt redirected to an unexpected host");
+              }
+              currentUrl = nextUrl;
+            }
+            throw new Error("Too many DeviantArt redirects");
+          }
+          
+          async function requestOAuthToken(env, grantFields, credentialMode = "body") {
+            if (!env.DEVIANTART_CLIENT_ID || !env.DEVIANTART_CLIENT_SECRET) {
+              throw new Error("DEVIANTART_CLIENT_ID or DEVIANTART_CLIENT_SECRET is not configured");
+            }
+          
+            const form = new URLSearchParams(grantFields);
+            const headers = {
+              ...deviantArtBaseHeaders(),
+              "content-type": "application/x-www-form-urlencoded",
+            };
+          
+            if (credentialMode === "basic") {
+              headers.Authorization = `Basic ${btoa(`${env.DEVIANTART_CLIENT_ID}:${env.DEVIANTART_CLIENT_SECRET}`)}`;
+            } else {
+              form.set("client_id", env.DEVIANTART_CLIENT_ID);
+              form.set("client_secret", env.DEVIANTART_CLIENT_SECRET);
+            }
+          
+            const response = await fetch(DEVIANTART_TOKEN_URL, {
+              method: "POST",
+              headers,
+              body: form.toString(),
+              redirect: "manual",
+            });
+            const body = await response.text();
+          
+            let payload = null;
+            try {
+              payload = JSON.parse(body);
+            } catch {}
+          
+            if (!response.ok || typeof payload?.access_token !== "string") {
+              const error = new Error(
+                `DeviantArt token request failed (${response.status}): ${cleanText(payload?.error ?? body, 160)}`,
+              );
+              error.status = response.status;
+              error.oauthError = payload?.error;
+              throw error;
+            }
+          
+            const accessToken = payload.access_token.trim();
+            if (!accessToken) throw new Error("DeviantArt returned an empty access token");
+            return {
+              accessToken,
+              refreshToken: typeof payload?.refresh_token === "string" ? payload.refresh_token.trim() : null,
+              expiresIn: Math.max(60, Number(payload?.expires_in ?? 3600)),
+              tokenType: String(payload?.token_type ?? "Bearer"),
+              scope: String(payload?.scope ?? ""),
+              status: String(payload?.status ?? ""),
+              credentialMode,
+            };
+          }
+          
+          async function requestOAuthTokenWithFallback(env, grantFields) {
+            let lastError = null;
+            for (const credentialMode of ["basic", "body"]) {
+              try {
+                return await requestOAuthToken(env, grantFields, credentialMode);
+              } catch (error) {
+                lastError = error;
+                console.error("DeviantArt token mode failed", credentialMode, error);
+              }
+            }
+            throw lastError ?? new Error("DeviantArt token request failed");
+          }
+          
+          async function probeDeviantArtToken(token) {
+            const tests = [];
+            for (const [name, url, method] of [
+              ["placebo:header", DEVIANTART_PLACEBO_URL, "GET"],
+              ["tag:furry:header", `${DEVIANTART_TAG_URL}?tag=furry&limit=1&offset=0&mature_content=false&with_session=false`, "GET"],
+            ]) {
+              try {
+                const response = await fetchDeviantArtWithBearer(new URL(url), token, { method });
+                const body = await response.text();
+                tests.push({ name, ok: response.ok, status: response.status, body: body.slice(0, 180) });
+                if (response.ok) return { ok: true, tests };
+              } catch (error) {
+                tests.push({ name, ok: false, error: String(error?.message ?? error) });
+              }
+            }
+            return { ok: false, tests };
+          }
+          
+          function cacheDeviantArtToken(tokenResult, source) {
+            cachedDeviantArtToken = tokenResult.accessToken;
+            cachedDeviantArtTokenExpiresAt =
+              Date.now() + Math.max(60, tokenResult.expiresIn - 120) * 1000;
+            cachedDeviantArtTokenSource = source;
+            cachedDeviantArtTokenMetadata = {
+              source,
+              token_type: tokenResult.tokenType,
+              expires_in: tokenResult.expiresIn,
+              scope: tokenResult.scope,
+              credential_mode: tokenResult.credentialMode,
+              token_length: tokenResult.accessToken.length,
+            };
+            return cachedDeviantArtToken;
+          }
+          
+          function setupRequiredError(details = null) {
+            const error = new Error("DeviantArt needs one-time user authorization");
+            error.code = "DA_SETUP_REQUIRED";
+            error.details = details;
+            return error;
+          }
+          
+          async function getDeviantArtToken(env, forceRefresh = false) {
+            const now = Date.now();
+            if (!forceRefresh && cachedDeviantArtToken && now < cachedDeviantArtTokenExpiresAt) {
+              return cachedDeviantArtToken;
+            }
+          
+            cachedDeviantArtToken = null;
+            cachedDeviantArtTokenExpiresAt = 0;
+          
+            if (env.DEVIANTART_REFRESH_TOKEN) {
+              try {
+                const refreshed = await requestOAuthTokenWithFallback(env, {
+                  grant_type: "refresh_token",
+                  refresh_token: env.DEVIANTART_REFRESH_TOKEN,
+                });
+                if (refreshed.refreshToken && refreshed.refreshToken !== env.DEVIANTART_REFRESH_TOKEN) {
+                  console.warn("DeviantArt returned a rotated refresh token; update the GitHub secret from the setup page if refresh later fails.");
+                }
+                return cacheDeviantArtToken(refreshed, "refresh_token");
+              } catch (error) {
+                console.error("Stored DeviantArt refresh token failed", error);
+                throw setupRequiredError({ refresh_token_failed: true });
+              }
+            }
+          
+            const attempts = [
+              { grant_type: "client_credentials", scope: "browse" },
+              { grant_type: "client_credentials" },
+            ];
+            const diagnostics = [];
+          
+            for (const grantFields of attempts) {
+              try {
+                const clientToken = await requestOAuthTokenWithFallback(env, grantFields);
+                const probe = await probeDeviantArtToken(clientToken.accessToken);
+                diagnostics.push({ grantFields, token: { expires_in: clientToken.expiresIn, scope: clientToken.scope }, probe });
+                if (probe.ok) return cacheDeviantArtToken(clientToken, "client_credentials");
+              } catch (error) {
+                diagnostics.push({ grantFields, error: String(error?.message ?? error) });
+              }
+            }
+          
+            console.error("DeviantArt client-credentials tokens were unusable", diagnostics);
+            throw setupRequiredError(diagnostics);
+          }
+          
+          async function handleDeviantArtSetup(request, env) {
+            if (!env.DEVIANTART_CLIENT_ID || !env.DEVIANTART_CLIENT_SECRET) {
+              return htmlPage("DeviantArt setup", '<p class="bad">Client ID or Client Secret is missing from the Worker.</p>', 500);
+            }
+          
+            const verifier = randomBase64Url(64);
+            const challenge = await sha256Base64Url(verifier);
+            const state = randomBase64Url(24);
+            const cookieValue = await createSignedOauthCookie(
+              {
+                verifier,
+                state,
+                redirect_uri: DEVIANTART_REDIRECT_URI,
+                expires_at: Date.now() + 10 * 60 * 1000,
+              },
+              env.DEVIANTART_CLIENT_SECRET,
+            );
+          
+            const authorizeUrl = new URL(DEVIANTART_AUTHORIZE_URL);
+            authorizeUrl.searchParams.set("response_type", "code");
+            authorizeUrl.searchParams.set("client_id", env.DEVIANTART_CLIENT_ID);
+            authorizeUrl.searchParams.set("redirect_uri", DEVIANTART_REDIRECT_URI);
+            authorizeUrl.searchParams.set("scope", "basic browse");
+            authorizeUrl.searchParams.set("state", state);
+            authorizeUrl.searchParams.set("code_challenge", challenge);
+            authorizeUrl.searchParams.set("code_challenge_method", "S256");
+          
+            return new Response(null, {
+              status: 302,
+              headers: {
+                location: authorizeUrl.toString(),
+                "set-cookie": `da_oauth=${cookieValue}; Max-Age=600; Path=/; HttpOnly; Secure; SameSite=Lax`,
+                "cache-control": "no-store",
+              },
+            });
+          }
+          
+          async function handleDeviantArtCallback(request, env) {
+            const url = new URL(request.url);
+            const oauthError = url.searchParams.get("error");
+            if (oauthError) {
+              return htmlPage(
+                "DeviantArt authorization failed",
+                `<p class="bad">${htmlEscape(oauthError)}: ${htmlEscape(url.searchParams.get("error_description") ?? "No description")}</p>`,
+                400,
+              );
+            }
+          
+            const code = url.searchParams.get("code");
+            const state = url.searchParams.get("state");
+            const cookie = parseCookies(request).da_oauth;
+            const saved = await readSignedOauthCookie(cookie, env.DEVIANTART_CLIENT_SECRET);
+            if (!code || !state || !saved || !constantTimeTextEqual(state, String(saved.state ?? ""))) {
+              return htmlPage(
+                "DeviantArt authorization failed",
+                '<p class="bad">The setup session is missing, expired, or invalid. Open <a href="/setup/deviantart">the setup page</a> and try again.</p>',
+                400,
+              );
+            }
+          
+            try {
+              const tokenResult = await requestOAuthTokenWithFallback(env, {
+                grant_type: "authorization_code",
+                code,
+                redirect_uri: saved.redirect_uri,
+                code_verifier: saved.verifier,
+              });
+              const probe = await probeDeviantArtToken(tokenResult.accessToken);
+              const clearCookie = "da_oauth=; Max-Age=0; Path=/; HttpOnly; Secure; SameSite=Lax";
+          
+              if (!tokenResult.refreshToken) {
+                return htmlPage(
+                  "DeviantArt authorized, but no refresh token was returned",
+                  `<p class="bad">Authorization completed, but DeviantArt did not issue a refresh token. Probe result:</p><pre>${htmlEscape(JSON.stringify(probe, null, 2))}</pre>`,
+                  500,
+                  { "set-cookie": clearCookie },
+                );
+              }
+          
+              return htmlPage(
+                "DeviantArt authorization complete",
+                `<p class="ok">The user access token works: ${probe.ok ? "yes" : "not confirmed"}.</p><p>Create one additional GitHub Actions secret:</p><pre>Name: DEVIANTART_REFRESH_TOKEN
+          Value: ${htmlEscape(tokenResult.refreshToken)}</pre><p>Then rerun the GitHub workflow. Treat this refresh token like a password and do not post it in chat.</p><p>After deployment, check <a href="/debug/deviantart">/debug/deviantart</a>.</p>`,
+                200,
+                { "set-cookie": clearCookie },
+              );
+            } catch (error) {
+              console.error("DeviantArt authorization-code exchange failed", error);
+              return htmlPage(
+                "DeviantArt authorization failed",
+                `<p class="bad">${htmlEscape(error?.message ?? error)}</p><p>Open <a href="/setup/deviantart">the setup page</a> and try again.</p>`,
+                500,
+                { "set-cookie": "da_oauth=; Max-Age=0; Path=/; HttpOnly; Secure; SameSite=Lax" },
+              );
+            }
+          }
+          
+          async function requestDeviantArtJson(url, token, label, maxAttempts = 3) {
+            for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+              console.log("DeviantArt request", label, `attempt=${attempt}`, url.toString());
+              const response = await fetchDeviantArtWithBearer(url, token, { method: "GET" });
               const body = await response.text();
-
+          
               console.log(
                 "DeviantArt response",
                 label,
@@ -352,7 +668,7 @@ jobs:
                 `status=${response.status}`,
                 response.headers.get("content-type") ?? "unknown",
               );
-
+          
               if (response.ok) {
                 try {
                   return JSON.parse(body);
@@ -361,7 +677,7 @@ jobs:
                   throw new Error("Artwork source returned invalid JSON");
                 }
               }
-
+          
               console.error(
                 "DeviantArt request failed",
                 label,
@@ -369,7 +685,12 @@ jobs:
                 `status=${response.status}`,
                 body.slice(0, 300),
               );
-
+          
+              if (response.status === 401 && cachedDeviantArtTokenSource === "refresh_token") {
+                cachedDeviantArtToken = null;
+                cachedDeviantArtTokenExpiresAt = 0;
+              }
+          
               const retryable = [429, 500, 502, 503, 504].includes(response.status);
               if (!retryable || attempt === maxAttempts) {
                 const error = new Error(`Artwork source returned HTTP ${response.status}`);
@@ -377,13 +698,13 @@ jobs:
                 error.label = label;
                 throw error;
               }
-
-              await sleep(300 * 2 ** (attempt - 1));
+          
+              await sleep(350 * 2 ** (attempt - 1));
             }
-
+          
             throw new Error("DeviantArt request failed without a response");
           }
-
+          
           async function requestDeviantArtTag(tag, token) {
             const url = new URL(DEVIANTART_TAG_URL);
             url.searchParams.set("tag", tag);
@@ -393,7 +714,7 @@ jobs:
             url.searchParams.set("with_session", "false");
             return requestDeviantArtJson(url, token, `tag:${tag}`, 2);
           }
-
+          
           async function requestDeviantArtSearch(endpoint, token, query) {
             const url = new URL(endpoint);
             url.searchParams.set("q", query);
@@ -401,14 +722,14 @@ jobs:
             url.searchParams.set("offset", "0");
             url.searchParams.set("mature_content", "false");
             url.searchParams.set("with_session", "false");
-
+          
             if (endpoint.endsWith("/popular")) {
               url.searchParams.set("timerange", "alltime");
             }
-
+          
             return requestDeviantArtJson(url, token, endpoint.split("/").at(-1), 3);
           }
-
+          
           function rankArtwork(deviation, tags) {
             const haystack = cleanText(
               `${deviation?.title ?? ""} ${deviation?.author?.username ?? ""}`,
@@ -422,14 +743,14 @@ jobs:
             score += Math.min(5, Number(deviation?.stats?.favourites ?? 0) / 1000);
             return score + Math.random();
           }
-
+          
           async function findArtwork(tags, env) {
             const token = await getDeviantArtToken(env);
             const terms = normalizeSearchTerms(tags);
             const query = `furry ${terms}`.trim();
             const collected = new Map();
             let lastError = null;
-
+          
             // Tag browsing is a separate DeviantArt endpoint and is often more stable
             // than text search. Try useful query tags first, then furry/anthro.
             const tagCandidates = [
@@ -440,7 +761,7 @@ jobs:
             ]
               .map((tag) => tag.replace(/[^a-z0-9_]/gi, "").slice(0, 30))
               .filter(Boolean);
-
+          
             for (const tag of [...new Set(tagCandidates)].slice(0, 4)) {
               try {
                 const payload = await requestDeviantArtTag(tag, token);
@@ -455,12 +776,12 @@ jobs:
                 console.error("DeviantArt tag endpoint failed; continuing", tag, error);
               }
             }
-
+          
             if (collected.size > 0) {
               return [...collected.values()]
                 .sort((a, b) => rankArtwork(b, tags) - rankArtwork(a, tags))[0];
             }
-
+          
             // Fall back to normal DeviantArt text-search endpoints.
             for (const endpoint of DEVIANTART_SEARCH_ENDPOINTS) {
               try {
@@ -476,85 +797,52 @@ jobs:
                 console.error("DeviantArt endpoint failed; trying fallback", endpoint, error);
               }
             }
-
+          
             if (lastError) throw lastError;
             return null;
           }
-
+          
           async function runDeviantArtDiagnostics(env) {
             const report = {
               ok: false,
               generated_at: new Date().toISOString(),
+              oauth_mode: "OAuth 2.1 bearer header",
               credentials_present: {
                 client_id: Boolean(env.DEVIANTART_CLIENT_ID),
                 client_secret: Boolean(env.DEVIANTART_CLIENT_SECRET),
+                refresh_token: Boolean(env.DEVIANTART_REFRESH_TOKEN),
               },
+              setup_url: `${WORKER_ORIGIN}/setup/deviantart`,
+              token: null,
               tests: [],
             };
-
+          
             let token;
             try {
-              token = await getDeviantArtToken(env);
-              report.tests.push({ name: "token", ok: true });
+              token = await getDeviantArtToken(env, true);
+              report.token = cachedDeviantArtTokenMetadata;
             } catch (error) {
-              report.tests.push({ name: "token", ok: false, error: String(error?.message ?? error) });
+              report.error = String(error?.message ?? error);
+              report.error_code = error?.code ?? null;
+              report.details = error?.details ?? null;
               return report;
             }
-
+          
             const tests = [
-              {
-                name: "placebo:form",
-                url: new URL(DEVIANTART_PLACEBO_URL),
-                method: "POST",
-                body: new URLSearchParams({ access_token: token }).toString(),
-              },
-              {
-                name: "placebo:query",
-                url: authenticatedDeviantArtUrl(new URL(DEVIANTART_PLACEBO_URL), token),
-                method: "GET",
-              },
-              {
-                name: "tag:furry",
-                url: authenticatedDeviantArtUrl(
-                  new URL(`${DEVIANTART_TAG_URL}?tag=furry&limit=5&offset=0&mature_content=false&with_session=false`),
-                  token,
-                ),
-                method: "GET",
-              },
-              {
-                name: "newest:furry",
-                url: authenticatedDeviantArtUrl(
-                  new URL(`${DEVIANTART_SEARCH_ENDPOINTS[0]}?q=furry&limit=5&offset=0&mature_content=false&with_session=false`),
-                  token,
-                ),
-                method: "GET",
-              },
-              {
-                name: "popular:furry",
-                url: authenticatedDeviantArtUrl(
-                  new URL(`${DEVIANTART_SEARCH_ENDPOINTS[1]}?q=furry&timerange=alltime&limit=5&offset=0&mature_content=false&with_session=false`),
-                  token,
-                ),
-                method: "GET",
-              },
+              ["placebo:header", new URL(DEVIANTART_PLACEBO_URL)],
+              [
+                "tag:furry:header",
+                new URL(`${DEVIANTART_TAG_URL}?tag=furry&limit=5&offset=0&mature_content=false&with_session=false`),
+              ],
+              [
+                "newest:furry:header",
+                new URL(`${DEVIANTART_SEARCH_ENDPOINTS[0]}?q=furry&limit=5&offset=0&mature_content=false&with_session=false`),
+              ],
             ];
-
-            for (const test of tests) {
+          
+            for (const [name, url] of tests) {
               try {
-                const headers = deviantArtHeaders();
-                if (test.method === "POST") {
-                  headers["content-type"] = "application/x-www-form-urlencoded";
-                }
-                console.log(
-                  "DeviantArt diagnostic request",
-                  test.name,
-                  safeDeviantArtUrlForLog(test.url),
-                );
-                const response = await fetch(test.url, {
-                  method: test.method,
-                  headers,
-                  body: test.body,
-                });
+                const response = await fetchDeviantArtWithBearer(url, token, { method: "GET" });
                 const body = await response.text();
                 let resultCount = null;
                 try {
@@ -562,7 +850,7 @@ jobs:
                   resultCount = Array.isArray(parsed?.results) ? parsed.results.length : null;
                 } catch {}
                 report.tests.push({
-                  name: test.name,
+                  name,
                   ok: response.ok,
                   status: response.status,
                   content_type: response.headers.get("content-type"),
@@ -570,20 +858,16 @@ jobs:
                   body_preview: response.ok ? undefined : body.slice(0, 180),
                 });
               } catch (error) {
-                report.tests.push({
-                  name: test.name,
-                  ok: false,
-                  error: String(error?.message ?? error),
-                });
+                report.tests.push({ name, ok: false, error: String(error?.message ?? error) });
               }
             }
-
+          
             report.ok = report.tests.some(
-              (test) => ["tag:furry", "newest:furry", "popular:furry"].includes(test.name) && test.ok,
+              (test) => ["tag:furry:header", "newest:furry:header"].includes(test.name) && test.ok,
             );
             return report;
           }
-
+          
           function buildArtworkMessage(deviation, tags) {
             const artistText = cleanText(deviation?.author?.username ?? "Unknown", 100);
             const postUrl = deviation.url;
@@ -591,7 +875,7 @@ jobs:
             const title = cleanText(deviation?.title ?? "Furry artwork", 200);
             const matchedTerms = normalizeSearchTerms(tags);
             const encodedTags = encodeURIComponent(tags.join(" ")).slice(0, 78);
-
+          
             return {
               embeds: [
                 {
@@ -639,13 +923,13 @@ jobs:
               allowed_mentions: { parse: [] },
             };
           }
-
+          
           async function searchAndBuild(tags, env) {
             const deviation = await findArtwork(tags, env);
             if (!deviation) return null;
             return buildArtworkMessage(deviation, tags);
           }
-
+          
           async function handleCommand(interaction, env) {
             if (interaction?.data?.name !== "furry") {
               return ephemeralMessage("Unknown command.");
@@ -729,18 +1013,26 @@ jobs:
             async fetch(request, env) {
               const requestUrl = new URL(request.url);
               console.log("Worker invocation", request.method, requestUrl.pathname);
-
-              if (request.method === "GET" && requestUrl.pathname === "/debug/deviantart") {
-                const report = await runDeviantArtDiagnostics(env);
-                return json(report, report.ok ? 200 : 503);
-              }
-
-              if (request.method === "GET") {
-                return new Response(
-                  "Furry Art Finder user app is online. Diagnostic: /debug/deviantart",
-                  { headers: { "content-type": "text/plain; charset=UTF-8" } },
-                );
-              }
+          
+            if (request.method === "GET" && requestUrl.pathname === "/setup/deviantart") {
+              return handleDeviantArtSetup(request, env);
+            }
+          
+            if (request.method === "GET" && requestUrl.pathname === "/oauth/callback") {
+              return handleDeviantArtCallback(request, env);
+            }
+          
+            if (request.method === "GET" && requestUrl.pathname === "/debug/deviantart") {
+              const report = await runDeviantArtDiagnostics(env);
+              return json(report, report.ok ? 200 : 503);
+            }
+          
+            if (request.method === "GET") {
+              return new Response(
+                "Furry Art Finder is online. Setup: /setup/deviantart Diagnostic: /debug/deviantart",
+                { headers: { "content-type": "text/plain; charset=UTF-8" } },
+              );
+            }
           
               if (request.method !== "POST") {
                 return new Response("Method Not Allowed", { status: 405 });
@@ -907,8 +1199,22 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           DEVIANTART_CLIENT_SECRET: ${{ secrets.DEVIANTART_CLIENT_SECRET }}
 
+      - name: Add DeviantArt refresh token to Worker when configured
+        shell: bash
+        run: |
+          if [ -n "$DEVIANTART_REFRESH_TOKEN" ]; then
+            printf '%s' "$DEVIANTART_REFRESH_TOKEN" | npx wrangler secret put DEVIANTART_REFRESH_TOKEN
+          else
+            echo "DEVIANTART_REFRESH_TOKEN is not configured yet; use the Worker setup page after deployment."
+          fi
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          DEVIANTART_REFRESH_TOKEN: ${{ secrets.DEVIANTART_REFRESH_TOKEN }}
+
       - name: Register user-installed slash command
         run: npm run register
         env:
           DISCORD_APPLICATION_ID: ${{ secrets.DISCORD_APPLICATION_ID }}
           DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          
