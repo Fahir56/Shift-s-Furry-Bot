@@ -88,8 +88,10 @@ jobs:
           
           const EPHEMERAL = 1 << 6;
           const DEVIANTART_TOKEN_URL = "https://www.deviantart.com/oauth2/token";
-          const DEVIANTART_SEARCH_URL =
-            "https://www.deviantart.com/api/v1/oauth2/browse/popular";
+          const DEVIANTART_SEARCH_ENDPOINTS = [
+            "https://www.deviantart.com/api/v1/oauth2/browse/newest",
+            "https://www.deviantart.com/api/v1/oauth2/browse/popular",
+          ];
           const USER_AGENT =
             "ShiftFurrySearch/2.0 (by Fahir56 on GitHub; non-mature art search)";
 
@@ -297,54 +299,94 @@ jobs:
             return cachedDeviantArtToken;
           }
 
+          function sleep(milliseconds) {
+            return new Promise((resolve) => setTimeout(resolve, milliseconds));
+          }
+
+          async function requestDeviantArtSearch(endpoint, token, query) {
+            const url = new URL(endpoint);
+            url.searchParams.set("q", query);
+            url.searchParams.set("limit", "40");
+            url.searchParams.set("offset", "0");
+            url.searchParams.set("mature_content", "0");
+            url.searchParams.set("with_session", "0");
+
+            if (endpoint.endsWith("/popular")) {
+              url.searchParams.set("timerange", "alltime");
+            }
+
+            for (let attempt = 1; attempt <= 2; attempt += 1) {
+              const response = await fetch(url, {
+                headers: {
+                  accept: "application/json",
+                  "accept-encoding": "gzip, br",
+                  authorization: `Bearer ${token}`,
+                  "user-agent": USER_AGENT,
+                },
+              });
+
+              const body = await response.text();
+              if (response.ok) {
+                try {
+                  return JSON.parse(body);
+                } catch {
+                  console.error(
+                    "DeviantArt returned non-JSON",
+                    endpoint,
+                    response.headers.get("content-type"),
+                    body.slice(0, 300),
+                  );
+                  throw new Error("Artwork source returned invalid JSON");
+                }
+              }
+
+              console.error(
+                "DeviantArt search attempt failed",
+                endpoint,
+                `attempt=${attempt}`,
+                `status=${response.status}`,
+                response.headers.get("content-type"),
+                body.slice(0, 300),
+              );
+
+              const retryable = [429, 500, 502, 503, 504].includes(response.status);
+              if (!retryable || attempt === 2) {
+                const error = new Error(`Artwork source returned HTTP ${response.status}`);
+                error.status = response.status;
+                throw error;
+              }
+
+              await sleep(150 * attempt);
+            }
+
+            throw new Error("DeviantArt search failed without a response");
+          }
+
           async function findArtwork(tags, env) {
             const token = await getDeviantArtToken(env);
             const terms = normalizeSearchTerms(tags);
             const query = `furry ${terms}`.trim();
-            const url = new URL(DEVIANTART_SEARCH_URL);
-            url.searchParams.set("q", query);
-            url.searchParams.set("timerange", "alltime");
-            url.searchParams.set("limit", "50");
-            url.searchParams.set("offset", String(Math.floor(Math.random() * 5) * 10));
-            url.searchParams.set("mature_content", "false");
-            url.searchParams.set("with_session", "false");
+            let lastError = null;
 
-            const response = await fetch(url, {
-              headers: {
-                accept: "application/json",
-                authorization: `Bearer ${token}`,
-                "user-agent": USER_AGENT,
-                "dA-minor-version": "20240701",
-              },
-            });
+            for (const endpoint of DEVIANTART_SEARCH_ENDPOINTS) {
+              try {
+                const payload = await requestDeviantArtSearch(endpoint, token, query);
+                const results = Array.isArray(payload?.results) ? payload.results : [];
+                const usable = results.filter(isDisplayableArtwork);
 
-            const body = await response.text();
-            if (!response.ok) {
-              console.error(
-                "DeviantArt search failed",
-                response.status,
-                response.headers.get("content-type"),
-                body.slice(0, 300),
-              );
-              throw new Error(`Artwork source returned HTTP ${response.status}`);
+                if (usable.length > 0) {
+                  return usable[Math.floor(Math.random() * usable.length)];
+                }
+
+                console.warn("DeviantArt endpoint returned no usable images", endpoint, query);
+              } catch (error) {
+                lastError = error;
+                console.error("DeviantArt endpoint failed; trying fallback", endpoint, error);
+              }
             }
 
-            let payload;
-            try {
-              payload = JSON.parse(body);
-            } catch {
-              console.error(
-                "DeviantArt returned non-JSON",
-                response.headers.get("content-type"),
-                body.slice(0, 300),
-              );
-              throw new Error("Artwork source returned invalid JSON");
-            }
-
-            const results = Array.isArray(payload?.results) ? payload.results : [];
-            const usable = results.filter(isDisplayableArtwork);
-            if (usable.length === 0) return null;
-            return usable[Math.floor(Math.random() * usable.length)];
+            if (lastError) throw lastError;
+            return null;
           }
 
           function buildArtworkMessage(deviation, tags) {
@@ -444,6 +486,18 @@ jobs:
               });
             } catch (error) {
               console.error("Artwork search failed", error);
+              const status = Number(error?.status ?? 0);
+              if (status >= 500) {
+                return ephemeralMessage(
+                  "DeviantArt is returning a temporary server error. The bot tried both search endpoints; please try again in a minute.",
+                );
+              }
+              const status = Number(error?.status ?? 0);
+              if (status >= 500) {
+                return ephemeralMessage(
+                  "DeviantArt is returning a temporary server error. Please run `/furry` again in a minute.",
+                );
+              }
               return ephemeralMessage("The artwork source did not respond correctly. Please try again shortly.");
             }
           }
@@ -661,4 +715,5 @@ jobs:
         env:
           DISCORD_APPLICATION_ID: ${{ secrets.DISCORD_APPLICATION_ID }}
           DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          
           
