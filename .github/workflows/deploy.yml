@@ -288,7 +288,9 @@ jobs:
               const url = new URL(request.url);
               const report = await diagnostics(url.searchParams.get("q") ?? "blue wolf");
               return new Response(JSON.stringify(report), {
-                status: report.ok ? 200 : 502,
+                // Always return JSON with HTTP 200 so deployment logs can show the
+                // exact upstream status instead of curl hiding the response body.
+                status: 200,
                 headers: {
                   "content-type": "application/json; charset=UTF-8",
                   "cache-control": "no-store",
@@ -313,10 +315,10 @@ jobs:
           };
           __API_STATUS_JS_EOF__
           cat > lib/e6.js <<'__LIB_E6_JS_EOF__'
-          const SAFE_API = "https://e926.net/posts.json";
+          const SAFE_API = "https://e621.net/posts.json";
           const NSFW_API = "https://e621.net/posts.json";
           const USER_AGENT =
-            "ShiftFurrySearch/7.0 (Discord user app; source code on github.com/Fahir56/Shift-s-Furry-Bot)";
+            "ShiftFurrySearch/8.0 (Discord user app; https://github.com/Fahir56/Shift-s-Furry-Bot)";
           
           const MAX_QUERY_LENGTH = 55;
           const CACHE_TTL_MS = 45_000;
@@ -460,12 +462,18 @@ jobs:
           }
           
           async function fetchJson(url) {
-            const response = await fetch(url, {
-              headers: {
-                accept: "application/json",
-                "user-agent": USER_AGENT,
-              },
-            });
+            const headers = {
+              accept: "application/json",
+              "user-agent": USER_AGENT,
+            };
+
+            const apiUser = String(process.env.E621_USERNAME ?? "").trim();
+            const apiKey = String(process.env.E621_API_KEY ?? "").trim();
+            if (apiUser && apiKey) {
+              headers.authorization = `Basic ${Buffer.from(`${apiUser}:${apiKey}`).toString("base64")}`;
+            }
+
+            const response = await fetch(url, { headers });
             const body = await response.text();
           
             if (!response.ok) {
@@ -574,7 +582,7 @@ jobs:
           }
           
           export function buildArtworkMessage(post, mode, tags) {
-            const host = mode === "safe" ? "e926.net" : "e621.net";
+            const host = "e621.net";
             const postUrl = `https://${host}/posts/${post.id}`;
             const imageUrl = usableImageUrl(post);
             const source = firstExternalSource(post);
@@ -606,7 +614,7 @@ jobs:
                 footer: {
                   text: mode === "nsfw"
                     ? "Age-restricted result from e621 • Underage-tag filters enforced"
-                    : "Safe-rated result from e926",
+                    : "Safe-rated result from e621",
                 },
               }],
               components: [{
@@ -781,7 +789,7 @@ jobs:
           
           A Discord **user-installed** app with two commands:
           
-          - `/furry query:...` uses **e926** and only accepts safe-rated results.
+          - `/furry query:...` uses **e621** with a forced safe rating.
           - `/furry-nsfw query:...` uses **e621**, is registered with Discord's `nsfw: true` field, and only accepts questionable/explicit results.
           
           Both commands reject underage-related search terms and returned posts tagged with common underage indicators.
@@ -796,8 +804,10 @@ jobs:
           - `DISCORD_PUBLIC_KEY`
           - `DISCORD_BOT_TOKEN`
           - `VERCEL_TOKEN`
+          - `E621_USERNAME` (optional, recommended if anonymous requests are blocked)
+          - `E621_API_KEY` (optional, use an API key, never the account password)
           
-          The deployment tests both e926 and e621 from Vercel **before** it changes your Discord Interactions Endpoint URL.
+          The deployment tests safe and age-restricted e621 searches from Vercel **before** it changes your Discord Interactions Endpoint URL.
           
           ## Deploy
           
@@ -902,7 +912,9 @@ jobs:
 
           DEPLOY_URL="$(
             npx vercel deploy --prod --yes --token="$VERCEL_TOKEN" \
-              --env "DISCORD_PUBLIC_KEY=$DISCORD_PUBLIC_KEY"
+              --env "DISCORD_PUBLIC_KEY=$DISCORD_PUBLIC_KEY" \
+              --env "E621_USERNAME=$E621_USERNAME" \
+              --env "E621_API_KEY=$E621_API_KEY"
           )"
 
           echo "Unique deployment URL: $DEPLOY_URL"
@@ -915,27 +927,34 @@ jobs:
         env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
           DISCORD_PUBLIC_KEY: ${{ secrets.DISCORD_PUBLIC_KEY }}
+          E621_USERNAME: ${{ secrets.E621_USERNAME }}
+          E621_API_KEY: ${{ secrets.E621_API_KEY }}
 
-      - name: Verify e926 and e621 from public Vercel domain
+      - name: Verify e621 safe and NSFW searches from public Vercel domain
         shell: bash
         run: |
           set -euo pipefail
           HEALTH_URL="${{ steps.vercel.outputs.public_base_url }}/health?q=blue%20wolf"
           echo "Testing $HEALTH_URL"
 
-          curl \
-            --location \
-            --max-redirs 5 \
-            --fail-with-body \
-            --show-error \
-            --silent \
-            --retry 3 \
-            --retry-all-errors \
-            --retry-delay 2 \
-            --output /tmp/health.json \
-            "$HEALTH_URL"
+          HTTP_STATUS="$(
+            curl \
+              --location \
+              --max-redirs 5 \
+              --show-error \
+              --silent \
+              --retry 3 \
+              --retry-all-errors \
+              --retry-delay 2 \
+              --output /tmp/health.json \
+              --write-out '%{http_code}' \
+              "$HEALTH_URL"
+          )"
 
+          echo "Health endpoint HTTP status: $HTTP_STATUS"
+          echo "Health endpoint response:"
           cat /tmp/health.json
+          echo
           node <<'NODE_EOF'
           const fs = require("fs");
           const raw = fs.readFileSync("/tmp/health.json", "utf8").trim();
@@ -950,7 +969,7 @@ jobs:
 
           console.log(JSON.stringify(report, null, 2));
           if (!report.ok) {
-            console.error("At least one artwork source is blocked from Vercel.");
+            console.error("The e621 API request failed from Vercel. The JSON above includes its exact HTTP status and response preview.");
             process.exit(1);
           }
           NODE_EOF
@@ -961,4 +980,3 @@ jobs:
           DISCORD_APPLICATION_ID: ${{ secrets.DISCORD_APPLICATION_ID }}
           DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
           INTERACTIONS_ENDPOINT_URL: ${{ steps.vercel.outputs.public_base_url }}/api/interactions
-          
