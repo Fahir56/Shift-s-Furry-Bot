@@ -1,4 +1,4 @@
-name: Deploy Furry Art Discord App (DeviantArt)
+name: Deploy Furry Art Discord App (DeviantArt Diagnostic)
 
 on:
   workflow_dispatch:
@@ -66,7 +66,11 @@ jobs:
             "compatibility_flags": ["nodejs_compat"],
             "workers_dev": true,
             "observability": {
-              "enabled": true
+              "enabled": true,
+              "logs": {
+                "invocation_logs": true,
+                "head_sampling_rate": 1
+              }
             }
           }
           WRANGLER_EOF
@@ -88,6 +92,8 @@ jobs:
           
           const EPHEMERAL = 1 << 6;
           const DEVIANTART_TOKEN_URL = "https://www.deviantart.com/oauth2/token";
+          const DEVIANTART_PLACEBO_URL = "https://www.deviantart.com/api/v1/oauth2/placebo";
+          const DEVIANTART_TAG_URL = "https://www.deviantart.com/api/v1/oauth2/browse/tags";
           const DEVIANTART_SEARCH_ENDPOINTS = [
             "https://www.deviantart.com/api/v1/oauth2/browse/newest",
             "https://www.deviantart.com/api/v1/oauth2/browse/popular",
@@ -303,81 +309,149 @@ jobs:
             return new Promise((resolve) => setTimeout(resolve, milliseconds));
           }
 
-          async function requestDeviantArtSearch(endpoint, token, query) {
-            const url = new URL(endpoint);
-            url.searchParams.set("q", query);
-            url.searchParams.set("limit", "40");
-            url.searchParams.set("offset", "0");
-            url.searchParams.set("mature_content", "0");
-            url.searchParams.set("with_session", "0");
+          function deviantArtHeaders(token) {
+            return {
+              accept: "application/json",
+              "accept-encoding": "gzip, br",
+              authorization: `Bearer ${token}`,
+              "user-agent": USER_AGENT,
+              "dA-minor-version": "20240701",
+            };
+          }
 
-            if (endpoint.endsWith("/popular")) {
-              url.searchParams.set("timerange", "alltime");
-            }
-
-            for (let attempt = 1; attempt <= 2; attempt += 1) {
+          async function requestDeviantArtJson(url, token, label, maxAttempts = 3) {
+            for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+              console.log("DeviantArt request", label, `attempt=${attempt}`, url.toString());
               const response = await fetch(url, {
-                headers: {
-                  accept: "application/json",
-                  "accept-encoding": "gzip, br",
-                  authorization: `Bearer ${token}`,
-                  "user-agent": USER_AGENT,
-                },
+                headers: deviantArtHeaders(token),
               });
-
               const body = await response.text();
+
+              console.log(
+                "DeviantArt response",
+                label,
+                `attempt=${attempt}`,
+                `status=${response.status}`,
+                response.headers.get("content-type") ?? "unknown",
+              );
+
               if (response.ok) {
                 try {
                   return JSON.parse(body);
                 } catch {
-                  console.error(
-                    "DeviantArt returned non-JSON",
-                    endpoint,
-                    response.headers.get("content-type"),
-                    body.slice(0, 300),
-                  );
+                  console.error("DeviantArt returned non-JSON", label, body.slice(0, 300));
                   throw new Error("Artwork source returned invalid JSON");
                 }
               }
 
               console.error(
-                "DeviantArt search attempt failed",
-                endpoint,
+                "DeviantArt request failed",
+                label,
                 `attempt=${attempt}`,
                 `status=${response.status}`,
-                response.headers.get("content-type"),
                 body.slice(0, 300),
               );
 
               const retryable = [429, 500, 502, 503, 504].includes(response.status);
-              if (!retryable || attempt === 2) {
+              if (!retryable || attempt === maxAttempts) {
                 const error = new Error(`Artwork source returned HTTP ${response.status}`);
                 error.status = response.status;
+                error.label = label;
                 throw error;
               }
 
-              await sleep(150 * attempt);
+              await sleep(300 * 2 ** (attempt - 1));
             }
 
-            throw new Error("DeviantArt search failed without a response");
+            throw new Error("DeviantArt request failed without a response");
+          }
+
+          async function requestDeviantArtTag(tag, token) {
+            const url = new URL(DEVIANTART_TAG_URL);
+            url.searchParams.set("tag", tag);
+            url.searchParams.set("limit", "50");
+            url.searchParams.set("offset", "0");
+            url.searchParams.set("mature_content", "false");
+            url.searchParams.set("with_session", "false");
+            return requestDeviantArtJson(url, token, `tag:${tag}`, 2);
+          }
+
+          async function requestDeviantArtSearch(endpoint, token, query) {
+            const url = new URL(endpoint);
+            url.searchParams.set("q", query);
+            url.searchParams.set("limit", "40");
+            url.searchParams.set("offset", "0");
+            url.searchParams.set("mature_content", "false");
+            url.searchParams.set("with_session", "false");
+
+            if (endpoint.endsWith("/popular")) {
+              url.searchParams.set("timerange", "alltime");
+            }
+
+            return requestDeviantArtJson(url, token, endpoint.split("/").at(-1), 3);
+          }
+
+          function rankArtwork(deviation, tags) {
+            const haystack = cleanText(
+              `${deviation?.title ?? ""} ${deviation?.author?.username ?? ""}`,
+              500,
+            ).toLowerCase();
+            let score = 0;
+            for (const tag of tags) {
+              const term = tag.replaceAll("_", " ").toLowerCase();
+              if (term && haystack.includes(term)) score += 3;
+            }
+            score += Math.min(5, Number(deviation?.stats?.favourites ?? 0) / 1000);
+            return score + Math.random();
           }
 
           async function findArtwork(tags, env) {
             const token = await getDeviantArtToken(env);
             const terms = normalizeSearchTerms(tags);
             const query = `furry ${terms}`.trim();
+            const collected = new Map();
             let lastError = null;
 
+            // Tag browsing is a separate DeviantArt endpoint and is often more stable
+            // than text search. Try useful query tags first, then furry/anthro.
+            const tagCandidates = [
+              ...tags.filter((tag) => !FUR_COLORS.has(tag)),
+              ...tags.filter((tag) => FUR_COLORS.has(tag)),
+              "furry",
+              "anthro",
+            ]
+              .map((tag) => tag.replace(/[^a-z0-9_]/gi, "").slice(0, 30))
+              .filter(Boolean);
+
+            for (const tag of [...new Set(tagCandidates)].slice(0, 4)) {
+              try {
+                const payload = await requestDeviantArtTag(tag, token);
+                const results = Array.isArray(payload?.results) ? payload.results : [];
+                for (const deviation of results.filter(isDisplayableArtwork)) {
+                  const id = String(deviation?.deviationid ?? deviation?.url ?? "");
+                  if (id) collected.set(id, deviation);
+                }
+                if (collected.size >= 20) break;
+              } catch (error) {
+                lastError = error;
+                console.error("DeviantArt tag endpoint failed; continuing", tag, error);
+              }
+            }
+
+            if (collected.size > 0) {
+              return [...collected.values()]
+                .sort((a, b) => rankArtwork(b, tags) - rankArtwork(a, tags))[0];
+            }
+
+            // Fall back to normal DeviantArt text-search endpoints.
             for (const endpoint of DEVIANTART_SEARCH_ENDPOINTS) {
               try {
                 const payload = await requestDeviantArtSearch(endpoint, token, query);
                 const results = Array.isArray(payload?.results) ? payload.results : [];
                 const usable = results.filter(isDisplayableArtwork);
-
                 if (usable.length > 0) {
-                  return usable[Math.floor(Math.random() * usable.length)];
+                  return usable.sort((a, b) => rankArtwork(b, tags) - rankArtwork(a, tags))[0];
                 }
-
                 console.warn("DeviantArt endpoint returned no usable images", endpoint, query);
               } catch (error) {
                 lastError = error;
@@ -387,6 +461,72 @@ jobs:
 
             if (lastError) throw lastError;
             return null;
+          }
+
+          async function runDeviantArtDiagnostics(env) {
+            const report = {
+              ok: false,
+              generated_at: new Date().toISOString(),
+              credentials_present: {
+                client_id: Boolean(env.DEVIANTART_CLIENT_ID),
+                client_secret: Boolean(env.DEVIANTART_CLIENT_SECRET),
+              },
+              tests: [],
+            };
+
+            let token;
+            try {
+              token = await getDeviantArtToken(env);
+              report.tests.push({ name: "token", ok: true });
+            } catch (error) {
+              report.tests.push({ name: "token", ok: false, error: String(error?.message ?? error) });
+              return report;
+            }
+
+            const tests = [
+              { name: "placebo", url: new URL(DEVIANTART_PLACEBO_URL) },
+              {
+                name: "tag:furry",
+                url: new URL(`${DEVIANTART_TAG_URL}?tag=furry&limit=5&offset=0&mature_content=false&with_session=false`),
+              },
+              {
+                name: "newest:furry",
+                url: new URL(`${DEVIANTART_SEARCH_ENDPOINTS[0]}?q=furry&limit=5&offset=0&mature_content=false&with_session=false`),
+              },
+              {
+                name: "popular:furry",
+                url: new URL(`${DEVIANTART_SEARCH_ENDPOINTS[1]}?q=furry&timerange=alltime&limit=5&offset=0&mature_content=false&with_session=false`),
+              },
+            ];
+
+            for (const test of tests) {
+              try {
+                const response = await fetch(test.url, { headers: deviantArtHeaders(token) });
+                const body = await response.text();
+                let resultCount = null;
+                try {
+                  const parsed = JSON.parse(body);
+                  resultCount = Array.isArray(parsed?.results) ? parsed.results.length : null;
+                } catch {}
+                report.tests.push({
+                  name: test.name,
+                  ok: response.ok,
+                  status: response.status,
+                  content_type: response.headers.get("content-type"),
+                  result_count: resultCount,
+                  body_preview: response.ok ? undefined : body.slice(0, 180),
+                });
+              } catch (error) {
+                report.tests.push({
+                  name: test.name,
+                  ok: false,
+                  error: String(error?.message ?? error),
+                });
+              }
+            }
+
+            report.ok = report.tests.some((test) => test.name.startsWith("tag:") && test.ok);
+            return report;
           }
 
           function buildArtworkMessage(deviation, tags) {
@@ -532,9 +672,17 @@ jobs:
           
           export default {
             async fetch(request, env) {
+              const requestUrl = new URL(request.url);
+              console.log("Worker invocation", request.method, requestUrl.pathname);
+
+              if (request.method === "GET" && requestUrl.pathname === "/debug/deviantart") {
+                const report = await runDeviantArtDiagnostics(env);
+                return json(report, report.ok ? 200 : 503);
+              }
+
               if (request.method === "GET") {
                 return new Response(
-                  "Furry Art Finder user app is online. Discord interactions must use POST requests.",
+                  "Furry Art Finder user app is online. Diagnostic: /debug/deviantart",
                   { headers: { "content-type": "text/plain; charset=UTF-8" } },
                 );
               }
@@ -710,3 +858,4 @@ jobs:
           DISCORD_APPLICATION_ID: ${{ secrets.DISCORD_APPLICATION_ID }}
           DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
           
+        
