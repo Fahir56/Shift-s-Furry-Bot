@@ -1,4 +1,4 @@
-name: Deploy Furry Art Discord App (DeviantArt OAuth 2.1)
+name: Deploy Furry Art Discord App (DeviantArt Durable OAuth)
 
 on:
   workflow_dispatch:
@@ -65,6 +65,20 @@ jobs:
             "compatibility_date": "2026-08-02",
             "compatibility_flags": ["nodejs_compat"],
             "workers_dev": true,
+            "durable_objects": {
+              "bindings": [
+                {
+                  "name": "DEVIANTART_TOKEN_VAULT",
+                  "class_name": "DeviantArtTokenVault"
+                }
+              ]
+            },
+            "exports": {
+              "DeviantArtTokenVault": {
+                "type": "durable-object",
+                "storage": "sqlite"
+              }
+            },
             "observability": {
               "enabled": true,
               "logs": {
@@ -77,6 +91,7 @@ jobs:
 
           cat > src/index.js <<'WORKER_EOF'
           import { verifyKey } from "discord-interactions";
+          import { DurableObject } from "cloudflare:workers";
           
           const INTERACTION = Object.freeze({
             PING: 1,
@@ -471,8 +486,8 @@ jobs:
           async function probeDeviantArtToken(token) {
             const tests = [];
             for (const [name, url, method] of [
-              ["placebo:minimal-header", DEVIANTART_PLACEBO_URL, "GET"],
-              ["tag:furry:minimal-header", `${DEVIANTART_TAG_URL}?tag=furry&limit=1&offset=0&mature_content=false&with_session=false`, "GET"],
+              ["placebo:durable-token", DEVIANTART_PLACEBO_URL, "GET"],
+              ["tag:furry:durable-token", `${DEVIANTART_TAG_URL}?tag=furry&limit=1&offset=0&mature_content=false&with_session=false`, "GET"],
             ]) {
               try {
                 const response = await fetchDeviantArtWithBearer(new URL(url), token, { method });
@@ -502,6 +517,165 @@ jobs:
             return cachedDeviantArtToken;
           }
           
+          export class DeviantArtTokenVault extends DurableObject {
+            constructor(ctx, env) {
+              super(ctx, env);
+              this.ctx = ctx;
+              this.env = env;
+            }
+
+            async fetch(request) {
+              const url = new URL(request.url);
+
+              if (url.pathname === "/status" && request.method === "GET") {
+                const refreshToken = await this.ctx.storage.get("refresh_token");
+                const accessToken = await this.ctx.storage.get("access_token");
+                const expiresAt = Number((await this.ctx.storage.get("access_expires_at")) ?? 0);
+                return json({
+                  ok: true,
+                  refresh_token_present: typeof refreshToken === "string" && refreshToken.length > 0,
+                  access_token_present: typeof accessToken === "string" && accessToken.length > 0,
+                  access_token_valid:
+                    typeof accessToken === "string" &&
+                    accessToken.length > 0 &&
+                    expiresAt > Date.now() + 120000,
+                  access_expires_at: expiresAt || null,
+                });
+              }
+
+              if (url.pathname === "/store" && request.method === "POST") {
+                const payload = await request.json();
+                const refreshToken = String(payload?.refresh_token ?? "").trim();
+                const accessToken = String(payload?.access_token ?? "").trim();
+                const expiresIn = Math.max(60, Number(payload?.expires_in ?? 3600));
+
+                if (!refreshToken || !accessToken) {
+                  return json({ ok: false, error: "Missing token data" }, 400);
+                }
+
+                await this.ctx.storage.put("refresh_token", refreshToken);
+                await this.ctx.storage.put("access_token", accessToken);
+                await this.ctx.storage.put(
+                  "access_expires_at",
+                  Date.now() + Math.max(60, expiresIn - 120) * 1000,
+                );
+                await this.ctx.storage.put("token_type", String(payload?.token_type ?? "Bearer"));
+                await this.ctx.storage.put("scope", String(payload?.scope ?? ""));
+                await this.ctx.storage.put(
+                  "credential_mode",
+                  String(payload?.credential_mode ?? "authorization_code"),
+                );
+
+                return json({ ok: true });
+              }
+
+              if (url.pathname === "/invalidate" && request.method === "POST") {
+                await this.ctx.storage.delete("access_token");
+                await this.ctx.storage.delete("access_expires_at");
+                return json({ ok: true });
+              }
+
+              if (url.pathname === "/access-token" && request.method === "POST") {
+                const forceRefresh = url.searchParams.get("force") === "1";
+                const storedAccessToken = await this.ctx.storage.get("access_token");
+                const storedExpiresAt = Number(
+                  (await this.ctx.storage.get("access_expires_at")) ?? 0,
+                );
+
+                if (
+                  !forceRefresh &&
+                  typeof storedAccessToken === "string" &&
+                  storedAccessToken.length > 0 &&
+                  storedExpiresAt > Date.now() + 120000
+                ) {
+                  return json({
+                    ok: true,
+                    access_token: storedAccessToken,
+                    expires_at: storedExpiresAt,
+                    source: "durable_object_cache",
+                    token_type: String((await this.ctx.storage.get("token_type")) ?? "Bearer"),
+                    scope: String((await this.ctx.storage.get("scope")) ?? ""),
+                    credential_mode: String(
+                      (await this.ctx.storage.get("credential_mode")) ?? "authorization_code",
+                    ),
+                  });
+                }
+
+                const refreshToken = await this.ctx.storage.get("refresh_token");
+                if (typeof refreshToken !== "string" || !refreshToken) {
+                  return json(
+                    {
+                      ok: false,
+                      code: "DA_SETUP_REQUIRED",
+                      error: "No refresh token is stored",
+                    },
+                    409,
+                  );
+                }
+
+                try {
+                  const refreshed = await requestOAuthTokenWithFallback(this.env, {
+                    grant_type: "refresh_token",
+                    refresh_token: refreshToken,
+                  });
+
+                  const nextRefreshToken = refreshed.refreshToken || refreshToken;
+                  const expiresAt =
+                    Date.now() + Math.max(60, refreshed.expiresIn - 120) * 1000;
+
+                  // DeviantArt may rotate refresh tokens. Persist the newest token
+                  // immediately so cold starts and later deployments keep working.
+                  await this.ctx.storage.put("refresh_token", nextRefreshToken);
+                  await this.ctx.storage.put("access_token", refreshed.accessToken);
+                  await this.ctx.storage.put("access_expires_at", expiresAt);
+                  await this.ctx.storage.put("token_type", refreshed.tokenType);
+                  await this.ctx.storage.put("scope", refreshed.scope);
+                  await this.ctx.storage.put("credential_mode", refreshed.credentialMode);
+
+                  return json({
+                    ok: true,
+                    access_token: refreshed.accessToken,
+                    expires_at: expiresAt,
+                    source: "refresh_token",
+                    token_type: refreshed.tokenType,
+                    scope: refreshed.scope,
+                    credential_mode: refreshed.credentialMode,
+                    refresh_token_rotated: nextRefreshToken !== refreshToken,
+                  });
+                } catch (error) {
+                  console.error("Durable token refresh failed", error);
+                  return json(
+                    {
+                      ok: false,
+                      code: "DA_SETUP_REQUIRED",
+                      error: String(error?.message ?? error),
+                    },
+                    401,
+                  );
+                }
+              }
+
+              return new Response("Not Found", { status: 404 });
+            }
+          }
+
+          function tokenVaultStub(env) {
+            const id = env.DEVIANTART_TOKEN_VAULT.idFromName("global");
+            return env.DEVIANTART_TOKEN_VAULT.get(id);
+          }
+
+          async function tokenVaultRequest(env, path, options = {}) {
+            const response = await tokenVaultStub(env).fetch(
+              new Request(`https://token-vault.internal${path}`, options),
+            );
+            const body = await response.text();
+            let payload = null;
+            try {
+              payload = JSON.parse(body);
+            } catch {}
+            return { response, payload, body };
+          }
+
           function setupRequiredError(details = null) {
             const error = new Error("DeviantArt needs one-time user authorization");
             error.code = "DA_SETUP_REQUIRED";
@@ -514,47 +688,41 @@ jobs:
             if (!forceRefresh && cachedDeviantArtToken && now < cachedDeviantArtTokenExpiresAt) {
               return cachedDeviantArtToken;
             }
-          
+
             cachedDeviantArtToken = null;
             cachedDeviantArtTokenExpiresAt = 0;
-          
-            if (env.DEVIANTART_REFRESH_TOKEN) {
-              try {
-                const refreshed = await requestOAuthTokenWithFallback(env, {
-                  grant_type: "refresh_token",
-                  refresh_token: env.DEVIANTART_REFRESH_TOKEN,
-                });
-                if (refreshed.refreshToken && refreshed.refreshToken !== env.DEVIANTART_REFRESH_TOKEN) {
-                  console.warn("DeviantArt returned a rotated refresh token; update the GitHub secret from the setup page if refresh later fails.");
-                }
-                return cacheDeviantArtToken(refreshed, "refresh_token");
-              } catch (error) {
-                console.error("Stored DeviantArt refresh token failed", error);
-                throw setupRequiredError({ refresh_token_failed: true });
-              }
+
+            const { response, payload, body } = await tokenVaultRequest(
+              env,
+              `/access-token${forceRefresh ? "?force=1" : ""}`,
+              { method: "POST" },
+            );
+
+            if (!response.ok || payload?.ok !== true || typeof payload?.access_token !== "string") {
+              console.error("DeviantArt token vault could not provide a token", response.status, body);
+              throw setupRequiredError({
+                refresh_token_failed: response.status === 401,
+                vault_status: response.status,
+              });
             }
-          
-            const attempts = [
-              { grant_type: "client_credentials", scope: "browse" },
-              { grant_type: "client_credentials" },
-            ];
-            const diagnostics = [];
-          
-            for (const grantFields of attempts) {
-              try {
-                const clientToken = await requestOAuthTokenWithFallback(env, grantFields);
-                const probe = await probeDeviantArtToken(clientToken.accessToken);
-                diagnostics.push({ grantFields, token: { expires_in: clientToken.expiresIn, scope: clientToken.scope }, probe });
-                if (probe.ok) return cacheDeviantArtToken(clientToken, "client_credentials");
-              } catch (error) {
-                diagnostics.push({ grantFields, error: String(error?.message ?? error) });
-              }
-            }
-          
-            console.error("DeviantArt client-credentials tokens were unusable", diagnostics);
-            throw setupRequiredError(diagnostics);
+
+            const expiresIn = Math.max(
+              60,
+              Math.floor((Number(payload.expires_at ?? 0) - Date.now()) / 1000),
+            );
+
+            return cacheDeviantArtToken(
+              {
+                accessToken: payload.access_token,
+                expiresIn,
+                tokenType: String(payload.token_type ?? "Bearer"),
+                scope: String(payload.scope ?? ""),
+                credentialMode: String(payload.credential_mode ?? "durable_object"),
+              },
+              String(payload.source ?? "durable_object"),
+            );
           }
-          
+
           async function handleDeviantArtSetup(request, env) {
             if (!env.DEVIANTART_CLIENT_ID || !env.DEVIANTART_CLIENT_SECRET) {
               return htmlPage("DeviantArt setup", '<p class="bad">Client ID or Client Secret is missing from the Worker.</p>', 500);
@@ -634,10 +802,28 @@ jobs:
                 );
               }
           
+              const stored = await tokenVaultRequest(env, "/store", {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({
+                  refresh_token: tokenResult.refreshToken,
+                  access_token: tokenResult.accessToken,
+                  expires_in: tokenResult.expiresIn,
+                  token_type: tokenResult.tokenType,
+                  scope: tokenResult.scope,
+                  credential_mode: tokenResult.credentialMode,
+                }),
+              });
+
+              if (!stored.response.ok || stored.payload?.ok !== true) {
+                throw new Error("Cloudflare could not store the DeviantArt token securely");
+              }
+
+              cacheDeviantArtToken(tokenResult, "authorization_code");
+
               return htmlPage(
                 "DeviantArt authorization complete",
-                `<p class="ok">The user access token works: ${probe.ok ? "yes" : "not confirmed"}.</p><p>Create one additional GitHub Actions secret:</p><pre>Name: DEVIANTART_REFRESH_TOKEN
-          Value: ${htmlEscape(tokenResult.refreshToken)}</pre><p>Then rerun the GitHub workflow. Treat this refresh token like a password and do not post it in chat.</p><p>After deployment, check <a href="/debug/deviantart">/debug/deviantart</a>.</p>`,
+                `<p class="ok">Authorization is saved securely in Cloudflare.</p><p>The user access token works: ${probe.ok ? "yes" : "not confirmed"}.</p><p>You do not need to copy a refresh token or rerun GitHub Actions.</p><p>Open <a href="/debug/deviantart">/debug/deviantart</a> to test the API, then try the Discord command.</p>`,
                 200,
                 { "set-cookie": clearCookie },
               );
@@ -800,23 +986,26 @@ jobs:
           }
           
           async function runDeviantArtDiagnostics(env) {
+            const vaultStatus = await tokenVaultRequest(env, "/status", { method: "GET" });
             const report = {
               ok: false,
               generated_at: new Date().toISOString(),
-              oauth_mode: "OAuth 2.1 minimal bearer header",
+              oauth_mode: "OAuth 2.1 with automatic rotated-token storage",
               credentials_present: {
                 client_id: Boolean(env.DEVIANTART_CLIENT_ID),
                 client_secret: Boolean(env.DEVIANTART_CLIENT_SECRET),
-                refresh_token: Boolean(env.DEVIANTART_REFRESH_TOKEN),
+                refresh_token: vaultStatus.payload?.refresh_token_present === true,
               },
+              token_vault: vaultStatus.payload ?? null,
               setup_url: `${WORKER_ORIGIN}/setup/deviantart`,
               token: null,
               tests: [],
             };
-          
+
             let token;
             try {
-              token = await getDeviantArtToken(env, true);
+              // Diagnostics must not force a refresh. The vault refreshes only near expiry.
+              token = await getDeviantArtToken(env, false);
               report.token = cachedDeviantArtTokenMetadata;
             } catch (error) {
               report.error = String(error?.message ?? error);
@@ -826,13 +1015,13 @@ jobs:
             }
           
             const tests = [
-              ["placebo:minimal-header", new URL(DEVIANTART_PLACEBO_URL)],
+              ["placebo:durable-token", new URL(DEVIANTART_PLACEBO_URL)],
               [
-                "tag:furry:minimal-header",
+                "tag:furry:durable-token",
                 new URL(`${DEVIANTART_TAG_URL}?tag=furry&limit=5&offset=0&mature_content=false&with_session=false`),
               ],
               [
-                "newest:furry:minimal-header",
+                "newest:furry:durable-token",
                 new URL(`${DEVIANTART_SEARCH_ENDPOINTS[0]}?q=furry&limit=5&offset=0&mature_content=false&with_session=false`),
               ],
             ];
@@ -860,7 +1049,7 @@ jobs:
             }
           
             report.ok = report.tests.some(
-              (test) => ["tag:furry:minimal-header", "newest:furry:minimal-header"].includes(test.name) && test.ok,
+              (test) => ["tag:furry:durable-token", "newest:furry:durable-token"].includes(test.name) && test.ok,
             );
             return report;
           }
@@ -1196,21 +1385,9 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           DEVIANTART_CLIENT_SECRET: ${{ secrets.DEVIANTART_CLIENT_SECRET }}
 
-      - name: Add DeviantArt refresh token to Worker when configured
-        shell: bash
-        run: |
-          if [ -n "$DEVIANTART_REFRESH_TOKEN" ]; then
-            printf '%s' "$DEVIANTART_REFRESH_TOKEN" | npx wrangler secret put DEVIANTART_REFRESH_TOKEN
-          else
-            echo "DEVIANTART_REFRESH_TOKEN is not configured yet; use the Worker setup page after deployment."
-          fi
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          DEVIANTART_REFRESH_TOKEN: ${{ secrets.DEVIANTART_REFRESH_TOKEN }}
-
       - name: Register user-installed slash command
         run: npm run register
         env:
           DISCORD_APPLICATION_ID: ${{ secrets.DISCORD_APPLICATION_ID }}
           DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          
