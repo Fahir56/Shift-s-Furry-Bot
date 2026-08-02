@@ -103,7 +103,6 @@ jobs:
             "ShiftFurrySearch/3.0 (by Fahir56 on GitHub; non-mature art search)";
           const WORKER_ORIGIN = "https://furry-art-finder-app.hsa94110.workers.dev";
           const DEVIANTART_REDIRECT_URI = `${WORKER_ORIGIN}/oauth/callback`;
-          const API_MINOR_VERSION = "20240701";
           
           let cachedDeviantArtToken = null;
           let cachedDeviantArtTokenExpiresAt = 0;
@@ -366,7 +365,6 @@ jobs:
           function deviantArtBaseHeaders() {
             return {
               accept: "application/json",
-              "accept-encoding": "gzip, br",
               "user-agent": USER_AGENT,
             };
           }
@@ -384,7 +382,6 @@ jobs:
                 if (!headers.has(name)) headers.set(name, value);
               }
               headers.set("Authorization", `Bearer ${token}`);
-              headers.set("dA-minor-version", API_MINOR_VERSION);
           
               const response = await fetch(currentUrl, {
                 ...options,
@@ -474,8 +471,8 @@ jobs:
           async function probeDeviantArtToken(token) {
             const tests = [];
             for (const [name, url, method] of [
-              ["placebo:header", DEVIANTART_PLACEBO_URL, "GET"],
-              ["tag:furry:header", `${DEVIANTART_TAG_URL}?tag=furry&limit=1&offset=0&mature_content=false&with_session=false`, "GET"],
+              ["placebo:minimal-header", DEVIANTART_PLACEBO_URL, "GET"],
+              ["tag:furry:minimal-header", `${DEVIANTART_TAG_URL}?tag=furry&limit=1&offset=0&mature_content=false&with_session=false`, "GET"],
             ]) {
               try {
                 const response = await fetchDeviantArtWithBearer(new URL(url), token, { method });
@@ -806,7 +803,7 @@ jobs:
             const report = {
               ok: false,
               generated_at: new Date().toISOString(),
-              oauth_mode: "OAuth 2.1 bearer header",
+              oauth_mode: "OAuth 2.1 minimal bearer header",
               credentials_present: {
                 client_id: Boolean(env.DEVIANTART_CLIENT_ID),
                 client_secret: Boolean(env.DEVIANTART_CLIENT_SECRET),
@@ -829,13 +826,13 @@ jobs:
             }
           
             const tests = [
-              ["placebo:header", new URL(DEVIANTART_PLACEBO_URL)],
+              ["placebo:minimal-header", new URL(DEVIANTART_PLACEBO_URL)],
               [
-                "tag:furry:header",
+                "tag:furry:minimal-header",
                 new URL(`${DEVIANTART_TAG_URL}?tag=furry&limit=5&offset=0&mature_content=false&with_session=false`),
               ],
               [
-                "newest:furry:header",
+                "newest:furry:minimal-header",
                 new URL(`${DEVIANTART_SEARCH_ENDPOINTS[0]}?q=furry&limit=5&offset=0&mature_content=false&with_session=false`),
               ],
             ];
@@ -863,7 +860,7 @@ jobs:
             }
           
             report.ok = report.tests.some(
-              (test) => ["tag:furry:header", "newest:furry:header"].includes(test.name) && test.ok,
+              (test) => ["tag:furry:minimal-header", "newest:furry:minimal-header"].includes(test.name) && test.ok,
             );
             return report;
           }
@@ -1217,4 +1214,3 @@ jobs:
         env:
           DISCORD_APPLICATION_ID: ${{ secrets.DISCORD_APPLICATION_ID }}
           DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
-          
